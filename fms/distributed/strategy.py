@@ -6,7 +6,7 @@ import torch
 import torch.distributed
 from torch import nn
 
-from fms.utils import tp_wrapping
+from fms.utils import tp_wrapping, cp_wrapping
 
 
 if "DISTRIBUTED_STRATEGY_IGNORE_MODULES" in os.environ:
@@ -159,3 +159,19 @@ class TensorParallelStrategy(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return tp_wrapping.apply_tp(block, self.group)
+    
+
+class ContextParallelStrategy(DistributedStrategy):
+    def __init__(self, group=None, from_meta=False):
+        super().__init__(from_meta)
+        assert torch.distributed.is_initialized(), "must initialize a process group"
+        self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+
+    def _distribute_module(
+        self, module: nn.Module, final_layers: bool = False
+    ) -> nn.Module:
+        return cp_wrapping.apply_cp(module, self.group)
+
+    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        return cp_wrapping.apply_cp(block, self.group)
+
