@@ -704,11 +704,9 @@ def _load_partial_state_dict(
                     ) from e
                 if unused_keys_tp:
                     unused_keys.update(unused_keys_tp)
-                elif unused_keys_cp:
-                    unused_keys.update(unused_keys_cp)
                 else:
                     unused_keys.add(key)
-            
+
         elif distributed_strategy == 'cp':
             print("Here I am")
             try:
