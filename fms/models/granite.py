@@ -3,10 +3,11 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
-from typing_extensions import Unpack
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from typing_extensions import Unpack
 
 from fms import models
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
@@ -22,7 +23,6 @@ from fms.modules.positions import RotaryEmbedding
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,15 @@ class GraniteConfig(ModelConfig):
 
 
 class GraniteBlock(nn.Module):
-    def __init__(self, config: GraniteConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: GraniteConfig,
+        rotary_emb: RotaryEmbedding,
+        cp_mesh: DeviceMesh | None = None,
+    ):
         super(GraniteBlock, self).__init__()
         self.config = config
+        self.cp_mesh = cp_mesh
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -96,6 +102,7 @@ class GraniteBlock(nn.Module):
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
             scale_factor=self.config.attention_multiplier,
+            cp_mesh=self.cp_mesh,
         )
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
@@ -320,6 +327,7 @@ class Granite(nn.Module):
         self,
         config: Optional[GraniteConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        cp_mesh: DeviceMesh | None = None,
         **kwargs,
     ):
         super(Granite, self).__init__()
@@ -329,6 +337,7 @@ class Granite(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
+        self.cp_mesh = cp_mesh
 
         self.base_model = GraniteHeadless(self.config, self.distributed_strategy)
         self.head = nn.Linear(

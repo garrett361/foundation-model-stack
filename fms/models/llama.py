@@ -2,10 +2,11 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Tuple
-from typing_extensions import Unpack
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from typing_extensions import Unpack
 
 from fms import models
 from fms.distributed.strategy import (
@@ -26,7 +27,6 @@ from fms.modules.positions import RotaryEmbedding
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +62,15 @@ class LLaMAConfig(ModelConfig):
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: LLaMAConfig,
+        rotary_emb: RotaryEmbedding,
+        cp_mesh: DeviceMesh | None = None,
+    ):
         super(LLaMABlock, self).__init__()
         self.config = config
+        self.cp_mesh = cp_mesh
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -171,6 +177,7 @@ class LLaMA(nn.Module):
         self,
         config: Optional[LLaMAConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        cp_mesh: DeviceMesh | None = None,
         **kwargs,
     ):
         super(LLaMA, self).__init__()
@@ -180,6 +187,7 @@ class LLaMA(nn.Module):
             self.config = LLaMAConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
+        self.cp_mesh = cp_mesh
 
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
@@ -208,6 +216,7 @@ class LLaMA(nn.Module):
             )
             self.shared = shared
 
+        # TODO: @goon - cp offsets
         self.rot_emb = RotaryEmbedding(
             dim=self.config.emb_dim // self.config.nheads,
             scaling=self.config.rope_scaling,
@@ -223,7 +232,7 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, cp_mesh=cp_mesh)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
