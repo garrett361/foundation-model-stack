@@ -6,7 +6,7 @@ from torch import nn
 
 from fms.modules import UninitializedModule
 from fms.modules.tp import ShardType, TPModule
-
+from fms.modules.cp import CPModule
 
 __type_factory_map: dict[str, Callable] = {}
 __type_sharding_map: dict[str, Callable] = {}
@@ -171,7 +171,7 @@ class LinearParameterShardingInfo:
 
 def shard_base_linear(
     tensor_values: dict[str, torch.Tensor],
-    tp_module: TPModule,
+    tp_module: TPModule | CPModule,
     module_sharding_info: dict[str, LinearModuleShardingInfo],
     param_sharding_info: dict[str, dict[str, LinearParameterShardingInfo]],
 ) -> Optional[set]:
@@ -214,7 +214,7 @@ def shard_base_linear(
 
 def shard_torch_linear(
     tensor_values: dict[str, torch.Tensor],
-    tp_module: TPModule,
+    tp_module: TPModule | CPModule,
     module_sharding_info: dict[str, LinearModuleShardingInfo],
 ) -> Optional[set]:
     """
@@ -249,7 +249,6 @@ def shard_torch_linear(
         param_sharding_info,
     )
     return unused_keys
-
 
 register_linear_type_to_module_map("torch_linear", nn.Linear)
 register_linear_type_to_sharding_map("torch_linear", shard_torch_linear)

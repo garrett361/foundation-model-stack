@@ -10,9 +10,10 @@ from fms.modules.linear import (
     LinearParameterShardingInfo,
     register_linear_type_to_module_map,
     register_linear_type_to_sharding_map,
-    shard_base_linear,
+    shard_base_linear
 )
 from fms.modules.tp import ShardType, TPModule
+from fms.modules.cp import CPModule
 from fms.utils.config import ModelConfig
 
 
@@ -126,7 +127,7 @@ def get_gptq_linear(
 
 def shard_gptq_linear(
     tensor_values: dict[str, torch.Tensor],
-    tp_module: TPModule,
+    tp_module: TPModule | CPModule,
     module_sharding_info: dict[str, LinearModuleShardingInfo],
 ) -> Optional[set]:
     """
