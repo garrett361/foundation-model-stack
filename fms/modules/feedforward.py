@@ -20,7 +20,6 @@ from fms.modules.linear import (
 )
 from fms.modules.tp import TPModule
 
-
 class FeedForwardBlock(nn.Module):
     """
     A two-layer, symmetric, fully-connected MLP structure.
@@ -89,6 +88,7 @@ class FeedForwardBlock(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPFeedForwardBlock":
         return TPFeedForwardBlock.import_module(self, group)
+    
 
     def forward(self, x):
         out = self.a(self.w1(x))
@@ -284,6 +284,7 @@ class GatedLinearUnit(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPGatedLinearUnit":
         return TPGatedLinearUnit.import_module(self, group)
+    
 
     def forward(self, x):
         if self.fused:
@@ -452,6 +453,7 @@ class TPGatedLinearUnit(GatedLinearUnit, TPModule):
             self.use_bias,
             fused=False,
         ).to(self.w2.weight.device)
+    
 
 
 class ConditionalFeedForward(nn.Module):
@@ -488,6 +490,7 @@ class ConditionalFeedForward(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPConditionalFeedForward":
         return TPConditionalFeedForward.import_module(self, group)
+    
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
         # Check constraints.
@@ -611,7 +614,7 @@ class TPConditionalFeedForward(ConditionalFeedForward, TPModule):
         x_par = copy_to_tensor_model_parallel_region(x, self.group)
         out_par = ConditionalFeedForward.forward(self, x_par, expert_indices)
         return reduce_from_tensor_model_parallel_region(out_par, self.group)
-
+    
 
 class MOEFeedForward(nn.Module):
     """

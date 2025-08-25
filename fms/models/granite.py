@@ -15,6 +15,9 @@ from fms.modules.attention import (
     MultiHeadAttention,
     get_attention_type,
 )
+from fms.distributed.contextparallel import (
+    all_gather_from_context_parallel_region
+)
 from fms.modules.feedforward import GatedLinearUnit
 from fms.modules.layernorm import LayerNormParameterized
 from fms.modules.linear import get_linear_type
@@ -23,7 +26,6 @@ from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
 from fms.utils.headless import gather_outputs
-
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +175,9 @@ class GraniteHeadless(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
-
+        self.attn_name = None
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            self.attn_name = "cp"
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
         self.max_expected_seq_len = self.config.max_expected_seq_len
@@ -284,6 +288,8 @@ class GraniteHeadless(nn.Module):
         # x_in: batch_size x seq_len x emb_dim if input is already embedded, otherwise batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
+        if self.attn_name == "cp":
+            attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_causal_cp")
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
@@ -293,7 +299,7 @@ class GraniteHeadless(nn.Module):
 
         # this is the output cache for all the decoder layers
         present_key_value_states = []
-
+       
         for i, layer in enumerate(self.layers):
             output = layer(
                 x=x_in,
@@ -378,7 +384,13 @@ class Granite(nn.Module):
             past_key_value_states=past_key_value_states,
             **attn_kwargs,
         )
-
+        #fms.distributed.strategy.ContextParallelStrategy
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            x = self.distributed_strategy.distribute_input(x)
+            if attn_kwargs["mask"] != None:
+                attn_kwargs["mask"] = self.distributed_strategy.distribute_input(attn_kwargs["mask"])
+            if position_ids != None:
+                position_ids = self.distributed_strategy.distribute_input(position_ids)
         output, cache = self.base_model(
             x,
             position_ids,
@@ -386,6 +398,9 @@ class Granite(nn.Module):
             use_cache,
             **attn_kwargs,
         )
+
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            output = self.distributed_strategy.gather_tensor(output)
 
         output = gather_outputs(output, last_n_tokens, **attn_kwargs)
         preds = self.head(output)

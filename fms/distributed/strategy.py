@@ -6,7 +6,7 @@ import torch
 import torch.distributed
 from torch import nn
 
-from fms.utils import tp_wrapping
+from fms.utils import tp_wrapping, cp_wrapping
 
 
 if "DISTRIBUTED_STRATEGY_IGNORE_MODULES" in os.environ:
@@ -49,6 +49,17 @@ class DistributedStrategy:
             print(f"ignoring block={block_name} when distributing layer")
             return block
 
+    def distribute_input(self, model_input:torch.LongTensor):
+        """
+        Distribute input as-appropriate
+        """
+        return self._distribute_input(model_input) 
+    def gather_tensor(self, model_input:torch.LongTensor):
+        """
+        Distribute input as-appropriate
+        """
+        return self._gather_tensor(model_input)
+
     @abstractmethod
     def _distribute_module(
         self, module: nn.Module, final_layers: bool = False
@@ -65,6 +76,19 @@ class DistributedStrategy:
         """
         pass
 
+    @abstractmethod
+    def _distribute_input(self, model_input:torch.LongTensor):
+        """
+        Distribute each layer
+        """
+        pass
+    @abstractmethod
+    def _gather_tensor(self, model_input:torch.LongTensor):
+        """
+        Gather from each rank
+        """
+        pass
+
 
 class NotDistributed(DistributedStrategy):
     def __init__(self, from_meta=False):
@@ -77,6 +101,8 @@ class NotDistributed(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return block
+    def _distribute_input(self,model_input:torch.LongTensor):
+        return model_input
 
 
 NoOpStrategy = NotDistributed()
@@ -159,3 +185,25 @@ class TensorParallelStrategy(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return tp_wrapping.apply_tp(block, self.group)
+    
+
+class ContextParallelStrategy(DistributedStrategy):
+    def __init__(self, group=None, from_meta=False):
+        super().__init__(from_meta)
+        assert torch.distributed.is_initialized(), "must initialize a process group"
+        self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+
+    def _distribute_module(
+        self, module: nn.Module, final_layers: bool = False
+    ) -> nn.Module:
+        return module
+
+    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        return cp_wrapping.apply_layer_cp(block, self.group)
+
+    def _distribute_input(self,model_input:torch.LongTensor):
+        return cp_wrapping.apply_input_cp(model_input, self.group)
+
+    def _gather_tensor(self,model_input:torch.LongTensor):
+        return cp_wrapping.apply_gather_tensor_cp(model_input, self.group)
+
