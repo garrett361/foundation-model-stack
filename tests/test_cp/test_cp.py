@@ -16,53 +16,54 @@ class TestSingleGPU:
             dtype=torch.float32, device="cuda"
         )
         tokenizer = AutoTokenizer.from_pretrained(GRANITE_3Z_BV_PATH)
-        hf_model = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
+        model_hf = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
             dtype=torch.float32, device="cuda"
         )
         model.eval()
-        hf_model.eval()
+        model_hf.eval()
         input_text = "Where is the Thomas J. Watson Research Center located?"
         input_tokens = tokenizer(input_text, return_tensors="pt").to("cuda")
         with torch.no_grad():
             out = model(input_tokens["input_ids"])
-            hf_out = hf_model(**input_tokens).logits
+            out_hf = model_hf(**input_tokens).logits
             # HF always upcasts the logits
-            torch.testing.assert_close(out.to(hf_out), hf_out, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(out.to(out_hf), out_hf, atol=1e-2, rtol=1e-2)
 
     def test_fms_to_hf_sd(self) -> None:
         model = get_model("hf_pretrained", model_path=GRANITE_3Z_BV_PATH).to(
             dtype=torch.bfloat16, device="cuda"
         )
         tokenizer = AutoTokenizer.from_pretrained(GRANITE_3Z_BV_PATH)
-        hf_model = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
+        model_hf = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
             dtype=torch.bfloat16, device="cuda"
         )
         model.eval()
-        hf_model.eval()
+        model_hf.eval()
         input_text = "Where is the Thomas J. Watson Research Center located?"
         input_tokens = tokenizer(input_text, return_tensors="pt").to("cuda")
         with torch.no_grad():
-            hf_out = hf_model(**input_tokens).logits
-            fms_sd = model.state_dict()
-            hf_sd_from_fms = fms_to_hf_sd(
-                fms_sd,
+            out_hf = model_hf(**input_tokens).logits
+            sd_fms = model.state_dict()
+            sd_hf_from_fms = fms_to_hf_sd(
+                sd_fms,
                 n_layers=len(model.base_model.layers),
-                n_heads=hf_model.config.num_attention_heads,
-                n_kv_heads=hf_model.config.num_key_value_heads,
+                n_heads=model_hf.config.num_attention_heads,
+                n_kv_heads=model_hf.config.num_key_value_heads,
             )
-            hf_sd = hf_model.state_dict()
-            for k, v in hf_sd.items():
-                torch.testing.assert_close(v, hf_sd_from_fms[k])
-            hf_model.load_state_dict(hf_sd)
-            hf_out2 = hf_model(**input_tokens).logits
-            torch.testing.assert_close(hf_out, hf_out2)
+            sd_hf = model_hf.state_dict()
+            for k, v in sd_hf.items():
+                torch.testing.assert_close(v, sd_hf_from_fms[k])
+            model_hf.load_state_dict(sd_hf)
+            out_hf2 = model_hf(**input_tokens).logits
+            torch.testing.assert_close(out_hf, out_hf2)
 
 
 class TestGraniteCP(DTest):
     nlayers = 2
     seed = 42
-    cfg = GraniteConfig(nlayers=nlayers)
-    base_seq_len = 32
+    cfg = GraniteConfig(nlayers=nlayers, max_expected_seq_len=131072)
+    base_seq_len = 2048
+    dtype = torch.bfloat16  # Needed for ring_flash_attn
 
     def setup_method(self, method):
         torch.manual_seed(42)
@@ -93,7 +94,7 @@ class TestGraniteCP(DTest):
     ) -> torch.Tensor:
         torch.manual_seed(seed)
         return torch.randint(
-            self.vocab_size,
+            self.cfg.src_vocab_size,
             size=(
                 self.batch_size,
                 self.seq_len,
@@ -114,7 +115,7 @@ class TestGraniteCP(DTest):
         return torch.randn(
             batch_size,
             self.seq_len,
-            self.d_model,
+            self.cfg.emb_dim,
             device=self.device,
             dtype=dtype or self.dtype,
             requires_grad=requires_grad,
@@ -147,23 +148,26 @@ class TestGraniteCP(DTest):
         # Verify that FMS isn't sharding anything
         assert not any(isinstance(p, dist.tensor.DTensor) for p in model.parameters())
 
-    def test_fwd(self, cp_mamba_impl: str):
+    def test_fwd(self):
         with torch.no_grad():
-            torch.manual_seed(42)
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-            mamba2 = self.get_mamba2()
-            mamba2_cp = self.get_mamba2_cp(
-                cp_mesh=cp_mesh,
-                cp_mamba_impl=cp_mamba_impl,
-            )
+            model_cp = Granite(self.cfg, cp_mesh=cp_mesh).to(**self.factory_kwargs)
+            model_cp.reset_parameters()
+            model = Granite(self.cfg).to(**self.factory_kwargs)
 
-            inputs = self.get_inputs()
-            inputs_cp = self.get_cp_shard(inputs)
+            # Set all weights to be the same:
+            for p_cp, p in zip(model_cp.parameters(), model.parameters()):
+                p.data = p_cp.data
 
-            outputs = mamba2(inputs)
-            outputs_cp = mamba2_cp(inputs_cp)
+            # Verify models are the same:
+            sd_cp = model_cp.state_dict()
+            for k, v in model.state_dict().items():
+                torch.testing.assert_close(v, sd_cp[k], msg=f"Failed on {k=}")
 
-            outputs_shard = self.get_cp_shard(outputs)
-            torch.testing.assert_close(
-                outputs_cp, outputs_shard, atol=self.tol, rtol=self.tol
-            )
+            input_toks = self.get_input_toks()
+            input_toks_cp = self.get_cp_shard(input_toks)
+
+            out_cp = model_cp(input_toks_cp)
+            out = model(input_toks)
+            out_shard = self.get_cp_shard(out)
+            torch.testing.assert_close(out_cp, out_shard, atol=1e-2, rtol=1e-2)

@@ -168,6 +168,7 @@ class GraniteHeadless(nn.Module):
         self,
         config: Optional[GraniteConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        cp_mesh: DeviceMesh | None = None,
         **kwargs,
     ):
         super(GraniteHeadless, self).__init__()
@@ -177,6 +178,7 @@ class GraniteHeadless(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
+        self.cp_mesh = cp_mesh
 
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
@@ -205,7 +207,7 @@ class GraniteHeadless(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = GraniteBlock(self.config, self.rot_emb)
+            block: nn.Module = GraniteBlock(self.config, self.rot_emb, cp_mesh=cp_mesh)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -339,7 +341,9 @@ class Granite(nn.Module):
         self.distributed_strategy = distributed_strategy
         self.cp_mesh = cp_mesh
 
-        self.base_model = GraniteHeadless(self.config, self.distributed_strategy)
+        self.base_model = GraniteHeadless(
+            self.config, self.distributed_strategy, cp_mesh=cp_mesh
+        )
         self.head = nn.Linear(
             self.config.emb_dim, self.config.src_vocab_size, bias=False
         )

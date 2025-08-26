@@ -666,6 +666,18 @@ class MultiHeadAttention(nn.Module):
 
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
+            if self.cp_mesh is not None:
+                assert position_ids is None
+                # [CP RoPE Offset]
+                # Need proper offsets for correctness. Assumption: all ranks get the same number of
+                # tokens.
+                seq_len = queries.shape[1]
+                position_ids = torch.arange(
+                    0, seq_len, dtype=torch.long, device=queries.device
+                ).repeat(keys.size(0), 1)
+                offset = seq_len * self.cp_mesh.get_local_rank()
+                position_ids.add_(offset)
+
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
