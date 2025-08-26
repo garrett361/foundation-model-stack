@@ -12,22 +12,24 @@ GRANITE_3Z_BV_PATH = "/proj/data-eng/chirag/.cache/models--ibm-granite--granite-
 
 class TestSingleGPU:
     def test_load_model_correctness(self) -> None:
-        model = get_model("hf_pretrained", model_path=GRANITE_3Z_BV_PATH).cuda()
-
+        model = get_model("hf_pretrained", model_path=GRANITE_3Z_BV_PATH).to(
+            dtype=torch.float32, device="cuda"
+        )
         tokenizer = AutoTokenizer.from_pretrained(GRANITE_3Z_BV_PATH)
-        hf_model = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).cuda()
+        hf_model = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
+            dtype=torch.float32, device="cuda"
+        )
         model.eval()
         hf_model.eval()
         input_text = "Where is the Thomas J. Watson Research Center located?"
         input_tokens = tokenizer(input_text, return_tensors="pt").to("cuda")
-
-        out = model(input_tokens["input_ids"])
-        hf_out = hf_model(**input_tokens)
-        # HF always upcasts the logits
-        torch.testing.assert_close(
-            out.to(hf_out.logits), hf_out.logits, rtol=1e-1, atol=1e-1
-        )
-
+        with torch.no_grad():
+            out = model(input_tokens["input_ids"])
+            hf_out = hf_model(**input_tokens)
+            # HF always upcasts the logits
+            torch.testing.assert_close(
+                out.to(hf_out.logits), hf_out.logits, atol=1e-2, rtol=1e-2
+            )
 
 
 class TestGraniteCP(DTest):
