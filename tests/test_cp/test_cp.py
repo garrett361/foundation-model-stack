@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dtest import DTest
 from fms.models import get_model
-from fms.models.granite import Granite, GraniteConfig
+from fms.models.granite import Granite, GraniteConfig, fms_to_hf_sd
 
 GRANITE_3Z_BV_PATH = "/proj/data-eng/chirag/.cache/models--ibm-granite--granite-3.3-8b-base/snapshots/cfb7adb44a974653cbb2ff883653971c54dba578"
 
@@ -25,11 +25,37 @@ class TestSingleGPU:
         input_tokens = tokenizer(input_text, return_tensors="pt").to("cuda")
         with torch.no_grad():
             out = model(input_tokens["input_ids"])
-            hf_out = hf_model(**input_tokens)
+            hf_out = hf_model(**input_tokens).logits
             # HF always upcasts the logits
-            torch.testing.assert_close(
-                out.to(hf_out.logits), hf_out.logits, atol=1e-2, rtol=1e-2
+            torch.testing.assert_close(out.to(hf_out), hf_out, atol=1e-2, rtol=1e-2)
+
+    def test_fms_to_hf_sd(self) -> None:
+        model = get_model("hf_pretrained", model_path=GRANITE_3Z_BV_PATH).to(
+            dtype=torch.bfloat16, device="cuda"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(GRANITE_3Z_BV_PATH)
+        hf_model = AutoModelForCausalLM.from_pretrained(GRANITE_3Z_BV_PATH).to(
+            dtype=torch.bfloat16, device="cuda"
+        )
+        model.eval()
+        hf_model.eval()
+        input_text = "Where is the Thomas J. Watson Research Center located?"
+        input_tokens = tokenizer(input_text, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            hf_out = hf_model(**input_tokens).logits
+            fms_sd = model.state_dict()
+            hf_sd_from_fms = fms_to_hf_sd(
+                fms_sd,
+                n_layers=len(model.base_model.layers),
+                n_heads=hf_model.config.num_attention_heads,
+                n_kv_heads=hf_model.config.num_key_value_heads,
             )
+            hf_sd = hf_model.state_dict()
+            for k, v in hf_sd.items():
+                torch.testing.assert_close(v, hf_sd_from_fms[k])
+            hf_model.load_state_dict(hf_sd)
+            hf_out2 = hf_model(**input_tokens).logits
+            torch.testing.assert_close(hf_out, hf_out2)
 
 
 class TestGraniteCP(DTest):

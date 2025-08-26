@@ -616,3 +616,56 @@ serialization.register_adapter(
     "hf",
     ["hf_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"],
 )
+
+
+def fms_to_hf_sd(
+    input_sd: Mapping[str, Any], n_layers: int, n_heads: int, n_kv_heads: int, **kwargs
+) -> Mapping[str, Any]:
+    replacements = [
+        (r"^head\.weight", "lm_head.weight"),
+        (r"^base_model\.embedding\.weight", "model.embed_tokens.weight"),
+        (r"^base_model\.dec_norm", "model.norm"),
+        (r"^base_model\.layers", "model.layers"),
+        (r"\.attn\.dense", ".self_attn.o_proj"),
+        (r"\.ln", ".input_layernorm"),
+        (r"\.ff_ln", ".post_attention_layernorm"),
+        (r"\.ff_sub_layer\.w2", ".mlp.down_proj"),
+    ]
+    new_sd = {}
+    for name, param in input_sd.items():
+        new_name = name
+        for pattern, repl in replacements:
+            new_name = re.sub(pattern, repl, new_name)
+        if "fused" not in new_name:
+            new_sd[new_name] = param
+
+    # Handle fused weights
+    for layer_idx in range(n_layers):
+        qkv_fused_fqn = f"base_model.layers.{layer_idx}.attn.in_proj.qkv_fused.weight"
+        qkv_fused_weight = input_sd[qkv_fused_fqn]
+        q_shape = qkv_fused_weight.shape[-1]
+        kv_shape = (qkv_fused_weight.shape[0] - q_shape) // 2
+        q, k, v = qkv_fused_weight.tensor_split((q_shape, q_shape + kv_shape), dim=0)
+        # Account for sliced rotary:
+        # https://github.com/huggingface/transformers/blob/49e168ff08ed837f1d7c4f4dccac4ddc427f887a/src/transformers/models/llama/convert_llama_weights_to_hf.py?plain=1#L220
+        q = (
+            q.view(n_heads, q_shape // n_heads // 2, 2, q_shape)
+            .transpose(1, 2)
+            .reshape(q_shape, q_shape)
+        )
+        k = (
+            k.view(n_kv_heads, kv_shape // n_kv_heads // 2, 2, q_shape)
+            .transpose(1, 2)
+            .reshape(kv_shape, q_shape)
+        )
+        new_sd[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q
+        new_sd[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k
+        new_sd[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v
+
+        w2_fused_fqn = f"base_model.layers.{layer_idx}.ff_sub_layer.wg1_fused.weight"
+        w2_fused_weight = input_sd[w2_fused_fqn]
+        wg, w1 = w2_fused_weight.chunk(2, dim=0)
+        new_sd[f"model.layers.{layer_idx}.mlp.gate_proj.weight"] = wg
+        new_sd[f"model.layers.{layer_idx}.mlp.up_proj.weight"] = w1
+
+    return new_sd
