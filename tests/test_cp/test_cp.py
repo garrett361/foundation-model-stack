@@ -166,8 +166,14 @@ class TestGraniteCP(DTest):
 
             input_toks = self.get_input_toks()
             input_toks_cp = self.get_cp_shard(input_toks)
+            cp_seq_len = input_toks_cp.shape[1]
+            position_ids = torch.arange(
+                0, cp_seq_len, dtype=torch.long, device=input_toks_cp.device
+            ).repeat(input_toks_cp.shape[0], 1)
+            offset = cp_seq_len * cp_mesh.get_local_rank()
+            position_ids.add_(offset)
 
-            out_cp = model_cp(input_toks_cp)
+            out_cp = model_cp(input_toks_cp, position_ids=position_ids)
             out = model(input_toks)
             out_shard = self.get_cp_shard(out)
             torch.testing.assert_close(out_cp, out_shard, atol=1e-2, rtol=1e-2)
