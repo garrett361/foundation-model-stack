@@ -648,13 +648,11 @@ def _load_partial_state_dict(
                 break
 
         # Check if target_module has the Parameter/buffer
-        if distributed_strategy == 'tp':
-            print("Here I am not")
-            try:
+        try:
+            if distributed_strategy == 'tp':
                 # If TP sharding is not needed, copy the parameter
                 # into the model
                 if not needs_tp_sharding or tp_module is None:
-                    print("playing blah")
                     param = getattr(target_module, key_steps[-1])
 
                     # cast module parameter to non-meta device
@@ -669,7 +667,6 @@ def _load_partial_state_dict(
                     param.copy_(tensor_value, non_blocking=True)
 
                 elif tp_module is not None and tp_module not in seen_tp_modules:
-                    print("not playing blah")
                     seen_tp_modules.add(tp_module)
                     tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
 
@@ -693,27 +690,11 @@ def _load_partial_state_dict(
                         )
                     )
                     unused_keys_tp = tp_module.load_weights(tensor_values)
-            except Exception as e:
-                # capture error specific to shape mismatch and halt the processing
-                if "shape" in str(e) or "size" in str(e):
-                    raise ValueError(
-                        "Shape mismatch encountered while copying a tensor from the provided "
-                        "checkpoint into the model.\nIf running a quantized model, it may "
-                        "mean that the quantization setup used to train the checkpoint does "
-                        "not match the one used to instantiate the model."
-                    ) from e
-                if unused_keys_tp:
-                    unused_keys.update(unused_keys_tp)
-                else:
-                    unused_keys.add(key)
 
-        elif distributed_strategy == 'cp':
-            print("Here I am")
-            try:
+            elif distributed_strategy == 'cp':
                 # If CP sharding is not needed, copy the parameter
                 # into the model
                 if not needs_cp_sharding or cp_module is None:
-                    print("playing")
                     param = getattr(target_module, key_steps[-1])
 
                     # cast module parameter to non-meta device
@@ -728,7 +709,6 @@ def _load_partial_state_dict(
                     param.copy_(tensor_value, non_blocking=True)
 
                 elif cp_module is not None and cp_module not in seen_cp_modules:
-                    print("not playing")
                     seen_cp_modules.add(cp_module)
                     tensor_values = {k: v for k, v in state_dict.items() if cp_prefix in k}
 
@@ -752,18 +732,21 @@ def _load_partial_state_dict(
                         )
                     )
                     unused_keys_cp = cp_module.load_weights(tensor_values)
-            except Exception as e:
-                # capture error specific to shape mismatch and halt the processing
-                if "shape" in str(e) or "size" in str(e):
-                    raise ValueError(
-                        "Shape mismatch encountered while copying a tensor from the provided "
-                        "checkpoint into the model.\nIf running a quantized model, it may "
-                        "mean that the quantization setup used to train the checkpoint does "
-                        "not match the one used to instantiate the model."
-                    ) from e
-                if unused_keys_cp:
-                    unused_keys.update(unused_keys_cp)
-                else:
-                    unused_keys.add(key)
+        except Exception as e:
+            # capture error specific to shape mismatch and halt the processing
+            if "shape" in str(e) or "size" in str(e):
+                raise ValueError(
+                    "Shape mismatch encountered while copying a tensor from the provided "
+                    "checkpoint into the model.\nIf running a quantized model, it may "
+                    "mean that the quantization setup used to train the checkpoint does "
+                    "not match the one used to instantiate the model."
+                ) from e
+            if unused_keys_tp:
+                unused_keys.update(unused_keys_tp)
+            elif unused_keys_cp:
+                unused_keys.update(unused_keys_cp)
+            else:
+                unused_keys.add(key)
+
 
     return unused_keys

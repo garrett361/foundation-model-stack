@@ -6,7 +6,7 @@ from torch import nn
 
 from fms.modules import UninitializedModule
 from fms.modules.tp import ShardType, TPModule
-from fms.modules.cp import CPModule
+from fms.modules.cp import ShardType, CPModule
 
 __type_factory_map: dict[str, Callable] = {}
 __type_sharding_map: dict[str, Callable] = {}
