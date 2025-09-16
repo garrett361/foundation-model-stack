@@ -24,8 +24,7 @@ from fms.distributed.tensorparallel import (
     reduce_from_tensor_model_parallel_region,
 )
 from fms.distributed.contextparallel import (
-    copy_to_tensor_model_parallel_region,
-    reduce_from_tensor_model_parallel_region,
+    all_gather_from_context_parallel_region
 )
 from fms.modules.linear import (
     LinearModuleShardingInfo,
@@ -189,7 +188,162 @@ def _sdpa_store_op(
         )
     else:
         return (keys, values, keys, values)
+def torch_attn_primitives(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: Optional[float] = None,
+    is_causal: bool = False,
+) ->     tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns the softmax numerator, denominator, and max scale. These are primitive values which can
+    be used to build normal softmax attention and ring attention.
 
+    It is redundant to return both the denominator and max_score. They always appear in a particular
+    combination together and so just one tensor can be returned instead of two. But, this is good
+    enough for now. TODO: @goon - optimize.
+
+    TODO: @goon - rewrite in terms of aten._scaled_dot_product_flash_attention.default
+
+    NOTE: if any of the below aten ops are supported, we can also build ring attention using them,
+    but we assume they are not generally available:
+    * aten._scaled_dot_product_flash_attention
+    * aten._scaled_dot_product_efficient_attention
+    * aten._scaled_dot_product_cudnn_attention
+    See the native torch CP attn implementation: https://github.com/pytorch/pytorch/blob/e7cc42df58a86bee05944f6e80c535aa1d099443/torch/distributed/tensor/experimental/_attention.py?plain=1#L1
+
+    NOTE: if the model uses RoPE, some care must also be taken that RoPE is properly applied.
+    Namely, different CP ranks need to offset their seq idx positions appropriately.
+    """
+    #print(q.shape)
+    _,n_q_heads, seqlen, d_head = q.shape
+    n_k_heads = k.shape[1]
+    gqa_ratio, remainder = divmod(n_q_heads, n_k_heads)
+    if remainder:
+        raise ValueError(
+            f"The number of q-heads must be divisible by the number of k-heads: {q.shape=}, {k.shape=}"
+        )
+    if gqa_ratio != 1:
+        k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
+        v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
+
+    scale = scale or d_head ** (0.5)
+    scores = (q @ k.transpose(-1, -2)) / scale
+    if is_causal:
+        mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device).triu_(1)
+        scores.masked_fill_(mask[None], float("-inf"))
+    max_score = scores.max(dim=-1, keepdim=True).values
+    scores = (scores - max_score).exp()
+    numerator = scores @ v
+    denominator = scores.sum(dim=-1, keepdim=True)
+    return numerator, denominator, max_score
+
+def _sdpa_compute_op_cp(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    nheads: int,
+    kvheads: int,
+    p_dropout: float,
+    scale_factor: Optional[float],
+    group: Optional[ProcessGroup],
+    **attn_kwargs,
+) -> torch.Tensor:
+    queries = query.transpose(2, 1)
+
+    # no longer transposing prior to store, so need to check this in case of no cache
+    if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
+        key_cache = key_cache.transpose(2, 1)
+        value_cache = value_cache.transpose(2, 1)
+    mask = attn_kwargs.get("mask", None)
+
+    # TODO: Once we add alibi support, merge rel pos bias and mask into single float mask
+    if mask is not None:
+        # Our expected mask format is bs x q_len x k_len, so to make it broadcastable
+        # we need to create the nheads dimension
+        while len(mask.size()) != 4:  # expects bs (x nheads) x q_len x kv_len
+            mask = mask.unsqueeze(1)
+
+    # Expand kv so black-box attn will work
+    expansion = nheads // kvheads
+    # k/v: b h l d
+    if expansion != 1:
+        keys_e = key_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        values_e = (
+            value_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        )
+    else:
+        keys_e = key_cache
+        values_e = value_cache
+
+    attn_algorithm = attn_kwargs.get("attn_algorithm", None)
+    if attn_algorithm:
+        # Pick which fused attn kernels will run.
+        use_flash = attn_algorithm == "flash"
+        use_mem_efficient = attn_algorithm == "mem"
+        use_math = attn_algorithm == "math"
+
+        torch.backends.cuda.enable_flash_sdp(use_flash)
+        torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
+        torch.backends.cuda.enable_math_sdp(use_math)
+
+    attn_mask = mask
+    if attn_mask is not None and attn_mask.dtype != torch.bool:
+        attn_mask = attn_mask.to(dtype=queries.dtype)
+
+    is_causal = attn_kwargs.get(
+        "is_causal_mask",
+        mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
+    )
+    numerator, denominator, max_score = torch_attn_primitives(queries,keys_e,values_e, scale_factor, is_causal)
+    #print(queries.shape)
+    #print(keys_e.shape)
+    #print(values_e.shape)
+    rank, world_size = distributed.rank_and_world(group)
+    #print("outside:",rank)
+    for idx in range(1, world_size):
+        keys_e = all_gather_from_context_parallel_region(keys_e,rank=rank,pg=group)
+        values_e = all_gather_from_context_parallel_region(values_e,rank=rank,pg=group)
+        k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
+        #print("inside",rank)
+        #keys_e = k_blocks[(rank - 1) % world_size]
+        keys_e = k_blocks[rank]
+        v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
+        #values_e = v_blocks[(rank - 1) % world_size]
+        values_e = v_blocks[rank]
+        #k = ring_send_recv(k)
+        #v = ring_send_recv(v)
+        if is_causal and idx > self.rank:
+            # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
+            continue
+
+        # Update local results
+        ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
+            queries, keys_e, values_e, scale_factor, is_causal=False
+        )
+        new_max_score = torch.maximum(max_score, ring_max_score)
+        numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
+            max_score - new_max_score
+        ).exp() * numerator
+        denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
+            max_score - new_max_score
+        ).exp() * denominator
+
+        max_score = new_max_score
+
+    attn = numerator / denominator
+    #return numerator, denominator, max_score
+    if attn_algorithm:
+        torch.backends.cuda.enable_flash_sdp(__sdpa_previous_flash)
+        torch.backends.cuda.enable_mem_efficient_sdp(__sdpa_previous_mem_efficient)
+        torch.backends.cuda.enable_math_sdp(__sdpa_previous_math)
+
+    # attn: bs x seq_len x nheads*emb_v_per_head
+    # attn: b x h x qlen x ds
+    # attn after permute: b x qlen x h x ds
+    # b x qlen x (d)
+    attn = attn.transpose(2, 1).contiguous()
+    return attn
 
 def _sdpa_compute_op(
     query: torch.Tensor,
@@ -199,6 +353,7 @@ def _sdpa_compute_op(
     kvheads: int,
     p_dropout: float,
     scale_factor: Optional[float],
+    group: Optional[ProcessGroup],
     **attn_kwargs,
 ) -> torch.Tensor:
     queries = query.transpose(2, 1)
@@ -299,6 +454,12 @@ register_attention_op(
     "sdpa_causal",
     _sdpa_store_op,
     _sdpa_compute_op,
+    update_attn_kwargs_op=_sdpa_update_attn_kwargs,
+)
+register_attention_op(
+    "sdpa_causal_cp",
+    _sdpa_store_op,
+    _sdpa_compute_op_cp,
     update_attn_kwargs_op=_sdpa_update_attn_kwargs,
 )
 register_attention_op(
@@ -575,6 +736,7 @@ class MultiHeadAttention(nn.Module):
         fused: bool = True,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
+        group: Optional[ProcessGroup] = None,
     ):
         super(MultiHeadAttention, self).__init__()
         self.nheads = nheads
@@ -587,6 +749,7 @@ class MultiHeadAttention(nn.Module):
         self.fused = fused
         self.linear_config = linear_config
         self.scale_factor = scale_factor
+        self.group = group
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -620,6 +783,8 @@ class MultiHeadAttention(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
+    def to_cp(self, group: ProcessGroup) -> "CPMultiHeadAttention":
+        return CPMultiHeadAttention.import_module(self, group)
 
     def forward(
         self,
@@ -649,7 +814,8 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
-
+        #print(use_cache)
+        #print(q.size())
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
         # if we dont have the cache yet, we need to compute
@@ -667,6 +833,12 @@ class MultiHeadAttention(nn.Module):
 
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
+            #TODO add cp check
+            rank = distributed.local_rank()
+            #print(rank,q_len)
+            offset = q_len * rank
+            #print(rank,position_ids.shape)
+            position_ids.add_(offset)
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
@@ -698,6 +870,7 @@ class MultiHeadAttention(nn.Module):
                 self.kvheads,
                 self.p_dropout if self.training else 0.0,
                 self.scale_factor,
+                self.group,
                 **attn_kwargs,
             )
         else:
@@ -711,7 +884,6 @@ class MultiHeadAttention(nn.Module):
                 self.scale_factor,
                 **attn_kwargs,
             )
-
         attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         out = self.dense(attn)
 
@@ -776,6 +948,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
+            group,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -966,63 +1139,64 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
             fused,
             linear_config,
             scale_factor,
+            group,
         )
         self.pre_cp_nheads = nheads
         self.pre_cp_kvheads = kvheads
         self.setup_cp(rank, group)
 
-    def load_weights(
-        self,
-        tensor_values: dict[str, torch.Tensor],
-    ) -> Optional[set]:
-        """Define sharding info of MHA module as:
-        {'module_name': (module_obj, sharding_dim, max_partition)}
-        Then, call the pre-registered sharding function associated with
-        self.linear_type.
+    #def load_weights(
+    #    self,
+    #    tensor_values: dict[str, torch.Tensor],
+    #) -> Optional[set]:
+    #    """Define sharding info of MHA module as:
+    #    {'module_name': (module_obj, sharding_dim, max_partition)}
+    #    Then, call the pre-registered sharding function associated with
+    #    self.linear_type.
 
-        `sharding_dim` is sharding dimension of the `weights` parameter
-        of nn.Linear. It may differ for other types of linear or other
-        parameters.
+    #    `sharding_dim` is sharding dimension of the `weights` parameter
+    #    of nn.Linear. It may differ for other types of linear or other
+    #    parameters.
 
-        The numbers in `max_partition` signify the largest world size
-        till we need to duplicate. For instance if we have nheads=16 and
-        world_size=32, then first 2 ranks will get first 1/16th of query
-        """
+    #    The numbers in `max_partition` signify the largest world size
+    #    till we need to duplicate. For instance if we have nheads=16 and
+    #    world_size=32, then first 2 ranks will get first 1/16th of query
+    #    """
 
-        if self.fused:
-            module_sharding_info = {
-                "qkv_fused": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("qkv_fused"),
-                    0,
-                    [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
-                ),
-                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
-            }
-        else:
-            module_sharding_info = {
-                "query": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("query"), 0, [self.pre_tp_nheads]
-                ),
-                "key": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("key"), 0, [self.pre_tp_kvheads]
-                ),
-                "value": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("value"), 0, [self.pre_tp_kvheads]
-                ),
-                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
-            }
+    #    #if self.fused:
+    #    #    module_sharding_info = {
+    #    #        "qkv_fused": LinearModuleShardingInfo(
+    #    #            self.in_proj.get_submodule("qkv_fused"),
+    #    #            0,
+    #    #            [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
+    #    #        ),
+    #    #        "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
+    #    #    }
+    #    #else:
+    #    #    module_sharding_info = {
+    #    #        "query": LinearModuleShardingInfo(
+    #    #            self.in_proj.get_submodule("query"), 1, [self.pre_tp_nheads]
+    #    #        ), #0
+    #    #        "key": LinearModuleShardingInfo(
+    #    #            self.in_proj.get_submodule("key"), 1, [self.pre_tp_kvheads]
+    #    #        ), #0
+    #    #        "value": LinearModuleShardingInfo(
+    #    #            self.in_proj.get_submodule("value"), 1, [self.pre_tp_kvheads]
+    #    #        ), #0
+    #    #        "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
+    #    #    }
 
-        type_sharding_map = get_all_linear_type_to_sharding_maps()
+    #    #type_sharding_map = get_all_linear_type_to_sharding_maps()
 
-        # TODO: Remove assumption that all layers in module share quantization
-        module_name = getattr(self.dense, "module_name", None)
-        linear_type = get_linear_type(self.linear_config, module_name)
-        unused_keys = type_sharding_map[linear_type](
-            tensor_values,
-            self,
-            module_sharding_info,
-        )
-        return unused_keys
+    #    # TODO: Remove assumption that all layers in module share quantization
+    #    module_name = getattr(self.dense, "module_name", None)
+    #    linear_type = get_linear_type(self.linear_config, module_name)
+    #    unused_keys = type_sharding_map[linear_type](
+    #        tensor_values,
+    #        self,
+    #        module_sharding_info,
+    #    )
+    #    return unused_keys
 
     @staticmethod
     def import_module(
@@ -1044,26 +1218,26 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
         )
         return cp_mha
 
-    def _copy_to_cp_region(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor] = None,
-        v: Optional[torch.Tensor] = None,
-    ):
-        if (k is None and v is None) or (k is q and v is q):
-            q_par = copy_to_tensor_model_parallel_region(q, self.group)
-            if self.fused:
-                k_par = None
-                v_par = None
-            else:
-                k_par = copy_to_tensor_model_parallel_region(k, self.group)
-                v_par = copy_to_tensor_model_parallel_region(v, self.group)
-        else:
-            raise ValueError(
-                "both k and v must either be given as tensors or both None"
-            )
+    #def _copy_to_cp_region(
+    #    self,
+    #    q: torch.Tensor,
+    #    k: Optional[torch.Tensor] = None,
+    #    v: Optional[torch.Tensor] = None,
+    #):
+    #    if (k is None and v is None) or (k is q and v is q):
+    #        q_par = copy_to_tensor_model_parallel_region(q, self.group)
+    #        if self.fused:
+    #            k_par = None
+    #            v_par = None
+    #        else:
+    #            k_par = copy_to_tensor_model_parallel_region(k, self.group)
+    #            v_par = copy_to_tensor_model_parallel_region(v, self.group)
+    #    else:
+    #        raise ValueError(
+    #            "both k and v must either be given as tensors or both None"
+    #        )
 
-        return q_par, k_par, v_par
+    #    return q_par, k_par, v_par
 
     def forward(
         self,
@@ -1078,10 +1252,15 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
         """
         Check MultiHeadAttention for up-to-date arguments and docs
         """
+        #print(self.rank,q.shape)
+        #print(self.rank,k.shape)
 
-        q_par, k_par, v_par = self._copy_to_cp_region(q, k, v)
-
-        out_par = MultiHeadAttention.forward(
+        #q_par, k_par, v_par = self._copy_to_cp_region(q, k, v)
+        q_par, k_par, v_par = q,k,v
+        #attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_causal_cp")
+        attn_kwargs["attn_name"] = "sdpa_causal_cp"
+        #numerator, denominator, max_score = MultiHeadAttention.forward(
+        out = MultiHeadAttention.forward(
             self,
             q_par,
             k_par,
@@ -1091,12 +1270,15 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
             use_cache,
             **attn_kwargs,
         )
+        #numerator, denominator, max_score = torch_attn_primitives(q, k, v, self.scale_factor, is_causal=True)
 
+        return out
+        #TODO handle caching
         # if use_cache=True, we return the hidden_state as well as the kv cache.
         # We only reduce the output, and keep the cache thread-local
-        if use_cache:
-            out = reduce_from_tensor_model_parallel_region(out_par[0], self.group)
-            return out, out_par[1]
-        else:
-            out = reduce_from_tensor_model_parallel_region(out_par, self.group)
-            return out
+        #if use_cache:
+        #    out = reduce_from_tensor_model_parallel_region(out_par[0], self.group)
+        #    return out, out_par[1]
+        #else:
+        #    out = reduce_from_tensor_model_parallel_region(out_par, self.group)
+        #    return out
