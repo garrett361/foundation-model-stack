@@ -49,6 +49,18 @@ class DistributedStrategy:
             print(f"ignoring block={block_name} when distributing layer")
             return block
 
+    def distribute_input(self, model_input:torch.LongTensor):
+        """
+        Distribute input as-appropriate
+        """
+        return self._distribute_input(model_input) 
+    #    block_name = type(block).__name__
+    #    if self.__should_distribute(block_name):
+    #        return self._distribute_layer(block, layer)
+    #    else:
+    #        print(f"ignoring block={block_name} when distributing layer")
+    #        return block
+
     @abstractmethod
     def _distribute_module(
         self, module: nn.Module, final_layers: bool = False
@@ -60,6 +72,13 @@ class DistributedStrategy:
 
     @abstractmethod
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        """
+        Distribute each layer
+        """
+        pass
+
+    @abstractmethod
+    def _distribute_input(self, model_input:torch.LongTensor):
         """
         Distribute each layer
         """
@@ -170,8 +189,12 @@ class ContextParallelStrategy(DistributedStrategy):
     def _distribute_module(
         self, module: nn.Module, final_layers: bool = False
     ) -> nn.Module:
-        return cp_wrapping.apply_cp(module, self.group)
+        return module
+        #return cp_wrapping.apply_cp(module, self.group)
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
-        return cp_wrapping.apply_cp(block, self.group)
+        return cp_wrapping.apply_layer_cp(block, self.group)
+
+    def _distribute_input(self,model_input:torch.LongTensor):
+        return cp_wrapping.apply_input_cp(model_input, self.group)
 

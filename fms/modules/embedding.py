@@ -10,10 +10,10 @@ from fms.distributed.tensorparallel import (
     all_gather_from_tensor_model_parallel_region,
     copy_to_tensor_model_parallel_region,
 )
-from fms.distributed.contextparallel import (
-    all_gather_from_tensor_model_parallel_region,
-    copy_to_tensor_model_parallel_region,
-)
+#from fms.distributed.contextparallel import (
+#    all_gather_from_tensor_model_parallel_region,
+#    copy_to_tensor_model_parallel_region,
+#)
 from fms.modules.tp import TPModule
 from fms.modules.cp import CPModule
 
@@ -106,8 +106,8 @@ class WordEmbedding(nn.Module):
     def to_tp(self, group: ProcessGroup) -> "TPWordEmbedding":
         return TPWordEmbedding.import_module(self, group)
     
-    def to_cp(self, group: ProcessGroup) -> "CPWordEmbedding":
-        return CPWordEmbedding.import_module(self, group)
+    #def to_cp(self, group: ProcessGroup) -> "CPWordEmbedding":
+    #    return CPWordEmbedding.import_module(self, group)
 
     def forward(self, inp, reverse=False):
         # If reverse is False, compute input embeddings. If reverse is True, compute output logits.
