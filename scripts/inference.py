@@ -12,7 +12,6 @@ from fms.models import get_model
 from fms.utils import generation, tokenizers
 from fms.utils.generation import generate, pad_input_ids
 
-
 # This example script validates the LLaMA implementation by running inference on a couple of prompts.
 #
 # Example usage with single-GPU 7B model on slurm, with torch.compile and determinstic behavior:
@@ -118,7 +117,7 @@ if args.device_type == "cuda":
     device = torch.device(args.device_type, local_rank)
     torch.cuda.set_device(device)
 else:
-    device = torch.device(args.device_type)
+    device = torch.device(f"{args.device_type}:{local_rank}")
 
 default_dtype = None
 dtypes_map = {
@@ -141,7 +140,12 @@ if args.deterministic:
     torch.use_deterministic_algorithms(True)
 
 if args.distributed:
-    dist.init_process_group()
+    if args.device_type == "cuda":
+        dist.init_process_group()
+    elif args.device_type == "cpu":
+        dist.init_process_group(backend="gloo")
+    else:
+        raise ValueError(f"Unexpected {args.device_type=} not in ('cuda', 'cpu')")
 
 print("loading model")
 if args.distributed:
@@ -212,7 +216,11 @@ if args.batch_input:
     ids, padding_kwargs = pad_input_ids(ids, min_pad_length=args.min_pad_length)
 else:
     ids = prompt1
+    # TODO: @goon - DELETE
+    print(f"{args.min_pad_length=}")
     if args.min_pad_length != 0:
+        # TODO: @goon - DELETE
+        print("PADDING")
         ids, padding_kwargs = pad_input_ids([ids], min_pad_length=args.min_pad_length)
     else:
         padding_kwargs = None
@@ -256,6 +264,9 @@ def infer(use_cache, do_sample):
     if padding_kwargs is None:
         padding_kwargs = {}
     padding_kwargs["attn_name"] = args.attn_name
+    # TODO: @goon - DELETE
+    print(f"Model is given {ids=}, {padding_kwargs=}")
+    print(f"{ids.shape=}")
     result = generate(
         model,
         ids,
