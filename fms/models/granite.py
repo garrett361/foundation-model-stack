@@ -3,10 +3,11 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
-from typing_extensions import Unpack
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from typing_extensions import Unpack
 
 from fms import models
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
@@ -23,7 +24,6 @@ from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
 from fms.utils.headless import gather_outputs
-
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,15 @@ class GraniteConfig(ModelConfig):
 
 
 class GraniteBlock(nn.Module):
-    def __init__(self, config: GraniteConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: GraniteConfig,
+        rotary_emb: RotaryEmbedding,
+        cp_mesh: DeviceMesh | None = None,
+    ):
         super(GraniteBlock, self).__init__()
         self.config = config
+        self.cp_mesh = cp_mesh
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -97,6 +103,7 @@ class GraniteBlock(nn.Module):
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
             scale_factor=self.config.attention_multiplier,
+            cp_mesh=self.cp_mesh,
         )
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
@@ -162,6 +169,7 @@ class GraniteHeadless(nn.Module):
         self,
         config: Optional[GraniteConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        cp_mesh: DeviceMesh | None = None,
         **kwargs,
     ):
         super(GraniteHeadless, self).__init__()
@@ -171,6 +179,7 @@ class GraniteHeadless(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
+        self.cp_mesh = cp_mesh
 
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
@@ -199,7 +208,7 @@ class GraniteHeadless(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = GraniteBlock(self.config, self.rot_emb)
+            block: nn.Module = GraniteBlock(self.config, self.rot_emb, cp_mesh=cp_mesh)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -321,6 +330,7 @@ class Granite(nn.Module):
         self,
         config: Optional[GraniteConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        cp_mesh: DeviceMesh | None = None,
         **kwargs,
     ):
         super(Granite, self).__init__()
@@ -330,8 +340,11 @@ class Granite(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
+        self.cp_mesh = cp_mesh
 
-        self.base_model = GraniteHeadless(self.config, self.distributed_strategy)
+        self.base_model = GraniteHeadless(
+            self.config, self.distributed_strategy, cp_mesh=cp_mesh
+        )
         self.head = nn.Linear(
             self.config.emb_dim, self.config.src_vocab_size, bias=False
         )
@@ -607,3 +620,56 @@ serialization.register_adapter(
     "hf",
     ["hf_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"],
 )
+
+
+def fms_to_hf_sd(
+    input_sd: Mapping[str, Any], n_layers: int, n_heads: int, n_kv_heads: int, **kwargs
+) -> Mapping[str, Any]:
+    replacements = [
+        (r"^head\.weight", "lm_head.weight"),
+        (r"^base_model\.embedding\.weight", "model.embed_tokens.weight"),
+        (r"^base_model\.dec_norm", "model.norm"),
+        (r"^base_model\.layers", "model.layers"),
+        (r"\.attn\.dense", ".self_attn.o_proj"),
+        (r"\.ln", ".input_layernorm"),
+        (r"\.ff_ln", ".post_attention_layernorm"),
+        (r"\.ff_sub_layer\.w2", ".mlp.down_proj"),
+    ]
+    new_sd = {}
+    for name, param in input_sd.items():
+        new_name = name
+        for pattern, repl in replacements:
+            new_name = re.sub(pattern, repl, new_name)
+        if "fused" not in new_name:
+            new_sd[new_name] = param
+
+    # Handle fused weights
+    for layer_idx in range(n_layers):
+        qkv_fused_fqn = f"base_model.layers.{layer_idx}.attn.in_proj.qkv_fused.weight"
+        qkv_fused_weight = input_sd[qkv_fused_fqn]
+        q_shape = qkv_fused_weight.shape[-1]
+        kv_shape = (qkv_fused_weight.shape[0] - q_shape) // 2
+        q, k, v = qkv_fused_weight.tensor_split((q_shape, q_shape + kv_shape), dim=0)
+        # Account for sliced rotary:
+        # https://github.com/huggingface/transformers/blob/49e168ff08ed837f1d7c4f4dccac4ddc427f887a/src/transformers/models/llama/convert_llama_weights_to_hf.py?plain=1#L220
+        q = (
+            q.view(n_heads, q_shape // n_heads // 2, 2, q_shape)
+            .transpose(1, 2)
+            .reshape(q_shape, q_shape)
+        )
+        k = (
+            k.view(n_kv_heads, kv_shape // n_kv_heads // 2, 2, q_shape)
+            .transpose(1, 2)
+            .reshape(kv_shape, q_shape)
+        )
+        new_sd[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q
+        new_sd[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k
+        new_sd[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v
+
+        w2_fused_fqn = f"base_model.layers.{layer_idx}.ff_sub_layer.wg1_fused.weight"
+        w2_fused_weight = input_sd[w2_fused_fqn]
+        wg, w1 = w2_fused_weight.chunk(2, dim=0)
+        new_sd[f"model.layers.{layer_idx}.mlp.gate_proj.weight"] = wg
+        new_sd[f"model.layers.{layer_idx}.mlp.up_proj.weight"] = w1
+
+    return new_sd
