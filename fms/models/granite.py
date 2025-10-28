@@ -376,7 +376,8 @@ class Granite(nn.Module):
             past_key_value_states=past_key_value_states,
             **attn_kwargs,
         )
-        x = self.distributed_strategy.distribute_input(x)
+        if self.distributed_strategy == "cp":
+            x = self.distributed_strategy.distribute_input(x)
         output, cache = self.base_model(
             x,
             position_ids,
@@ -384,7 +385,7 @@ class Granite(nn.Module):
             use_cache,
             **attn_kwargs,
         )
-
+        #torch.save(output, 'op_cp.pt')
         if only_last_token:
             output = output[:, -1, :]
         preds = self.head(output)
