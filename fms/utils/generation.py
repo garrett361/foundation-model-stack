@@ -226,6 +226,7 @@ def generate(
             For example: if extra_kwargs contains position_ids and mask keys, these
             model parameters will be updated as-appropriate for each token generated.
     """
+    use_cache = False
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
 
@@ -261,7 +262,6 @@ def generate(
         start_time = time.time()
 
     eos_reached: bool = False
-
     for i in range(max_new_tokens):
         input_ids = next_input[:, -max_seq_len:]
 
@@ -274,6 +274,9 @@ def generate(
             input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
 
         output = model(input_ids, **kwargs)
+        #torch.save(output, 'op_cp.pt')
+        #print(output)
+        #break
         if use_cache:
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
@@ -311,6 +314,7 @@ def generate(
             )
 
         result = torch.cat((result, next_val), dim=-1)
+        #torch.save(result, 'op_cp_t1.pt')
 
         # avoid continuing to generate if all have reached EOS
         if eos_token_id is not None:
@@ -332,6 +336,8 @@ def generate(
 
         if eos_reached:
             break
+        #print(output)
+        break
 
     if timing == "e2e":
         if input_ids.device.type == "cuda":

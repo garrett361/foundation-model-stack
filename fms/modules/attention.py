@@ -22,6 +22,7 @@ from torch.distributed.distributed_c10d import ProcessGroup
 from torch.nn import functional as F
 
 from fms import distributed
+import torch.distributed as dist
 from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
@@ -252,8 +253,21 @@ def torch_attn_primitives(
         k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
         v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
 
-    scale = scale or d_head ** (0.5)
+    #dist.barrier()
+    #if dist.get_rank() == 0:
+    #    print("sclae bef",scale)
+    #dist.barrier()
+    #scale = scale or d_head ** (0.5)
+    scale = 1 /scale
     scores = (q @ k.transpose(-1, -2)) / scale
+    k_nan = torch.isinf(k).any()
+    q_nan = torch.isinf(q).any()
+    #dist.barrier()
+    #if dist.get_rank() == 0:
+    #    print("scale",scale)
+    #    print("q_inf",q.max())
+    #    print("k_inf",k.max())
+    #dist.barrier()
     if is_causal:
         mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device).triu_(1)
         scores.masked_fill_(mask[None], float("-inf"))
@@ -300,6 +314,10 @@ def _sdpa_compute_op_cp(
     else:
         keys_e = key_cache
         values_e = value_cache
+    #value_nan = torch.isnan(values_e).any()
+    #key_nan = torch.isnan(keys_e).any()
+    #print("value",value_nan)
+    #print("keys",key_nan)
 
     attn_algorithm = attn_kwargs.get("attn_algorithm", None)
     if attn_algorithm:
@@ -336,6 +354,10 @@ def _sdpa_compute_op_cp(
         v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
         #values_e = v_blocks[(rank - 1) % world_size]
         values_e = v_blocks[rank]
+        #value_nan = torch.isnan(values_e).any()
+        #key_nan = torch.isnan(keys_e).any()
+        #print("value",value_nan)
+        #print("keys",key_nan)
         #k = ring_send_recv(k)
         #v = ring_send_recv(v)
         if is_causal and idx > self.rank:
@@ -346,6 +368,8 @@ def _sdpa_compute_op_cp(
         ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
             queries, keys_e, values_e, scale_factor, is_causal=False
         )
+        #print("max_score",max_score)
+        #print("ring_max_score",ring_max_score)
         new_max_score = torch.maximum(max_score, ring_max_score)
         numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
             max_score - new_max_score
@@ -353,10 +377,31 @@ def _sdpa_compute_op_cp(
         denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
             max_score - new_max_score
         ).exp() * denominator
+        #dist.barrier()
+        #if dist.get_rank() == 0:
+        #    print("numerator",numerator)
+        #    print("den",denominator)
+        #dist.barrier()
+        #print("power",ring_max_score - new_max_score)
+        #print("exp",(ring_max_score - new_max_score).exp())
 
+
+
+        #numerator = ring_numerator + numerator
+        #denominator = ring_denominator + denominator
+        #value_nan = torch.isnan(numerator).any()
+        #key_nan = torch.isnan(denominator).any()
+        #print("num",value_nan)
+        #print("den",key_nan)
         max_score = new_max_score
+    value_nan = torch.isnan(numerator).any()
+    key_nan = torch.isnan(denominator).any()
+    #print("num",value_nan)
+    #print("den",key_nan)
 
     attn = numerator / denominator
+    attn_nan = torch.isnan(attn).any()
+    #print("attn",attn_nan)
     #return numerator, denominator, max_score
     if attn_algorithm:
         torch.backends.cuda.enable_flash_sdp(__sdpa_previous_flash)
@@ -957,8 +1002,9 @@ class MultiHeadAttention(nn.Module):
         # b x kvlen x h x ds
         # b x h x kvlen x ds
         # todo: Cross attention (This always is true for now)
+        #print("q",q)
         q_out, k_out, v_out = self.in_proj(q, k, v)
-
+        #print("q_out",q_out)
         # note: transposes will be moved in a later PR to fix dis-contiguous tensor issues
         queries = q_out.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
@@ -975,7 +1021,10 @@ class MultiHeadAttention(nn.Module):
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
-
+        #query_nan = torch.isnan(queries).any()
+        #key_nan = torch.isnan(keys).any()
+        #print("queries",query_nan)
+        #print("keys",key_nan)
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
         if use_cache:
@@ -993,6 +1042,10 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             keys_compute, values_compute = keys, values
+        #value_nan = torch.isnan(values_compute).any()
+        #key_nan = torch.isnan(keys_compute).any()
+        #print("value",value_nan)
+        #print("keys",key_nan)
 
         updated_attn_kwargs: Union[AttentionKwargs, SinkAttentionKwargs]
 
@@ -1028,6 +1081,8 @@ class MultiHeadAttention(nn.Module):
                 self.group,
                 **updated_attn_kwargs,
             )
+            #attn_nan = torch.isnan(attn).any()
+            #print("attn",attn_nan)
         else:
             attn = attn_compute_dict["compute_decode"](
                 queries,
@@ -1302,58 +1357,58 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
         self.pre_cp_kvheads = kvheads
         self.setup_cp(rank, group)
 
-    #def load_weights(
-    #    self,
-    #    tensor_values: dict[str, torch.Tensor],
-    #) -> Optional[set]:
-    #    """Define sharding info of MHA module as:
-    #    {'module_name': (module_obj, sharding_dim, max_partition)}
-    #    Then, call the pre-registered sharding function associated with
-    #    self.linear_type.
+    def load_weights(
+        self,
+        tensor_values: dict[str, torch.Tensor],
+    ) -> Optional[set]:
+        """Define sharding info of MHA module as:
+        {'module_name': (module_obj, sharding_dim, max_partition)}
+        Then, call the pre-registered sharding function associated with
+        self.linear_type.
 
-    #    `sharding_dim` is sharding dimension of the `weights` parameter
-    #    of nn.Linear. It may differ for other types of linear or other
-    #    parameters.
+        `sharding_dim` is sharding dimension of the `weights` parameter
+        of nn.Linear. It may differ for other types of linear or other
+        parameters.
 
-    #    The numbers in `max_partition` signify the largest world size
-    #    till we need to duplicate. For instance if we have nheads=16 and
-    #    world_size=32, then first 2 ranks will get first 1/16th of query
-    #    """
+        The numbers in `max_partition` signify the largest world size
+        till we need to duplicate. For instance if we have nheads=16 and
+        world_size=32, then first 2 ranks will get first 1/16th of query
+        """
+        if self.fused:
+            module_sharding_info = {
+                "qkv_fused": LinearModuleShardingInfo(
+                    self.in_proj.get_submodule("qkv_fused"),
+                    0,
+                    [self.pre_cp_nheads, self.pre_cp_kvheads, self.pre_cp_kvheads],
+                ),
+                #"dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
+                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
+            }
+        else:
+            module_sharding_info = {
+                "query": LinearModuleShardingInfo(
+                    self.in_proj.get_submodule("query"), 0, [self.pre_cp_nheads]
+                ), #0
+                "key": LinearModuleShardingInfo(
+                    self.in_proj.get_submodule("key"), 0, [self.pre_cp_kvheads]
+                ), #0
+                "value": LinearModuleShardingInfo(
+                    self.in_proj.get_submodule("value"), 0, [self.pre_cp_kvheads]
+                ), #0
+                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),#0
+            }
 
-    #    #if self.fused:
-    #    #    module_sharding_info = {
-    #    #        "qkv_fused": LinearModuleShardingInfo(
-    #    #            self.in_proj.get_submodule("qkv_fused"),
-    #    #            0,
-    #    #            [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
-    #    #        ),
-    #    #        "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
-    #    #    }
-    #    #else:
-    #    #    module_sharding_info = {
-    #    #        "query": LinearModuleShardingInfo(
-    #    #            self.in_proj.get_submodule("query"), 1, [self.pre_tp_nheads]
-    #    #        ), #0
-    #    #        "key": LinearModuleShardingInfo(
-    #    #            self.in_proj.get_submodule("key"), 1, [self.pre_tp_kvheads]
-    #    #        ), #0
-    #    #        "value": LinearModuleShardingInfo(
-    #    #            self.in_proj.get_submodule("value"), 1, [self.pre_tp_kvheads]
-    #    #        ), #0
-    #    #        "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
-    #    #    }
+        type_sharding_map = get_all_linear_type_to_sharding_maps()
 
-    #    #type_sharding_map = get_all_linear_type_to_sharding_maps()
-
-    #    # TODO: Remove assumption that all layers in module share quantization
-    #    module_name = getattr(self.dense, "module_name", None)
-    #    linear_type = get_linear_type(self.linear_config, module_name)
-    #    unused_keys = type_sharding_map[linear_type](
-    #        tensor_values,
-    #        self,
-    #        module_sharding_info,
-    #    )
-    #    return unused_keys
+        # TODO: Remove assumption that all layers in module share quantization
+        module_name = getattr(self.dense, "module_name", None)
+        linear_type = get_linear_type(self.linear_config, module_name)
+        unused_keys = type_sharding_map[linear_type](
+            tensor_values,
+            self,
+            module_sharding_info,
+        )
+        return unused_keys
 
     @staticmethod
     def import_module(

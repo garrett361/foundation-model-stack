@@ -188,6 +188,7 @@ def shard_base_linear(
     param_count = 0
     for module_name in module_sharding_info:
         for param_name in param_sharding_info[module_name]:
+            #print("in linear",module_name,param_name)
             if module_name not in all_params:
                 all_params[module_name] = {}
             all_params[module_name][param_name] = tp_module._get_sd_weight(

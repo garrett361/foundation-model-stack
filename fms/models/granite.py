@@ -379,7 +379,8 @@ class Granite(nn.Module):
             past_key_value_states=past_key_value_states,
             **attn_kwargs,
         )
-        x = self.distributed_strategy.distribute_input(x)
+        if self.distributed_strategy == "cp":
+            x = self.distributed_strategy.distribute_input(x)
         output, cache = self.base_model(
             x,
             position_ids,
@@ -388,6 +389,12 @@ class Granite(nn.Module):
             **attn_kwargs,
         )
 
+        # TODO: The original cp-clean commit (5b19f385) had
+        # `if only_last_token: output = output[:, -1, :]` here, but `only_last_token` was never
+        # a parameter of this forward() — it would be a NameError at runtime. Upstream PR #470
+        # (71eb2ea5) introduced `gather_outputs` which supersedes that pattern and handles both
+        # `last_n_tokens` and the deprecated `only_last_token` kwarg. Verify that
+        # `gather_outputs` is correct for the CP case (e.g. output shape after all-gather).
         output = gather_outputs(output, last_n_tokens, **attn_kwargs)
         preds = self.head(output)
         preds = preds / self.config.logits_scaling
