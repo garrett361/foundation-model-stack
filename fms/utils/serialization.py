@@ -375,6 +375,7 @@ def load_state_dict(
         raise ValueError("FSDP checkpoints can only be loaded into an FSDP model")
     if checkpoint_sharding == "tp" and distributed_strategy != "tp":
         raise ValueError("TP checkpoints can only be loaded into a TP model")
+    #TODO add if for cp
 
     # Before creating the Path object, check if model_path has a glob pattern
     if isinstance(model_path, str):
@@ -531,7 +532,6 @@ def load_state_dict_into_model(
     # 2. Decide if model needs sharding and how (for now only TP)
     needs_tp_sharding = checkpoint_sharding != "tp" and distributed_strategy == "tp"
     needs_cp_sharding = checkpoint_sharding != "cp" and distributed_strategy == "cp"
-
     # 3. Iterate over the weights and load them into the model
     used_keys = set()
     unused_keys = set()
@@ -542,6 +542,7 @@ def load_state_dict_into_model(
             if key in used_keys:
                 continue
             used_keys.add(key)
+            #print(used_keys)
 
             partial_sd = {key: state_dict[key]}
             # Find neighbors to the key. If the adapter requires a neighbor and
@@ -640,10 +641,10 @@ def _load_partial_state_dict(
                     target_module = target_module[int(key_steps[key_step])]  # type: ignore[index]
                     prefix += "." + key_steps[key_step]
                     key_step += 1
-                if isinstance(target_module, TPModule):
+                if distributed_strategy == 'tp' and isinstance(target_module, TPModule):
                     tp_module = target_module
                     tp_prefix = prefix
-                if isinstance(target_module, CPModule):
+                elif distributed_strategy == 'cp' and isinstance(target_module, CPModule):
                     cp_module = target_module
                     cp_prefix = prefix
             except AttributeError:
@@ -652,89 +653,71 @@ def _load_partial_state_dict(
 
         # Check if target_module has the Parameter/buffer
         try:
-            if distributed_strategy == 'tp':
+            #if distributed_strategy == 'tp':
                 # If TP sharding is not needed, copy the parameter
                 # into the model
-                if not needs_tp_sharding or tp_module is None:
+            if (not needs_tp_sharding and not needs_cp_sharding) or (tp_module is None and cp_module is None):
+                param = getattr(target_module, key_steps[-1])
+
+                # cast module parameter to non-meta device
+                if param.device == torch.device("meta"):
+                    param = _move_to_real_device(
+                        param=param,
+                        real_device=tensor_value.device,
+                        dtype=tensor_value.dtype if dtype is None else dtype,
+                    )
+                    setattr(target_module, key_steps[-1], param)
                     param = getattr(target_module, key_steps[-1])
+                param.copy_(tensor_value, non_blocking=True)
+            if needs_tp_sharding and tp_module is not None and tp_module not in seen_tp_modules:
+                seen_tp_modules.add(tp_module)
+                tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
 
-                    # cast module parameter to non-meta device
-                    if param.device == torch.device("meta"):
-                        param = _move_to_real_device(
-                            param=param,
-                            real_device=tensor_value.device,
-                            dtype=tensor_value.dtype if dtype is None else dtype,
-                        )
-                        setattr(target_module, key_steps[-1], param)
-                        param = getattr(target_module, key_steps[-1])
-                    param.copy_(tensor_value, non_blocking=True)
+                # when tensors from ckpt have all the same dtype,
+                # it can be enforced onto the module parameters
+                is_single_dtype = (
+                    len(set([v.dtype for v in tensor_values.values()])) == 1
+                )
 
-                elif tp_module is not None and tp_module not in seen_tp_modules:
-                    seen_tp_modules.add(tp_module)
-                    tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
-
-                    # when tensors from ckpt have all the same dtype,
-                    # it can be enforced onto the module parameters
-                    is_single_dtype = (
-                        len(set([v.dtype for v in tensor_values.values()])) == 1
+                tp_module._apply(
+                    lambda t: _move_to_real_device(
+                        param=t,
+                        real_device=tensor_value.device,
+                        dtype=(
+                            dtype
+                            if dtype is not None
+                            else tensor_value.dtype
+                            if is_single_dtype
+                            else t.dtype
+                        ),
                     )
+                )
+                unused_keys_tp = tp_module.load_weights(tensor_values)
+            elif needs_cp_sharding and cp_module is not None and cp_module not in seen_cp_modules:
+                seen_cp_modules.add(cp_module)
+                tensor_values = {k: v for k, v in state_dict.items() if cp_prefix in k}
 
-                    tp_module._apply(
-                        lambda t: _move_to_real_device(
-                            param=t,
-                            real_device=tensor_value.device,
-                            dtype=(
-                                dtype
-                                if dtype is not None
-                                else tensor_value.dtype
-                                if is_single_dtype
-                                else t.dtype
-                            ),
-                        )
+                # when tensors from ckpt have all the same dtype,
+                # it can be enforced onto the module parameters
+                is_single_dtype = (
+                    len(set([v.dtype for v in tensor_values.values()])) == 1
+                )
+
+                cp_module._apply(
+                    lambda t: _move_to_real_device(
+                        param=t,
+                        real_device=tensor_value.device,
+                        dtype=(
+                            dtype
+                            if dtype is not None
+                            else tensor_value.dtype
+                            if is_single_dtype
+                            else t.dtype
+                        ),
                     )
-                    unused_keys_tp = tp_module.load_weights(tensor_values)
+                )
+                unused_keys_cp = cp_module.load_weights(tensor_values)
 
-            elif distributed_strategy == 'cp':
-                # If CP sharding is not needed, copy the parameter
-                # into the model
-                if not needs_cp_sharding or cp_module is None:
-                    param = getattr(target_module, key_steps[-1])
-
-                    # cast module parameter to non-meta device
-                    if param.device == torch.device("meta"):
-                        param = _move_to_real_device(
-                            param=param,
-                            real_device=tensor_value.device,
-                            dtype=tensor_value.dtype if dtype is None else dtype,
-                        )
-                        setattr(target_module, key_steps[-1], param)
-                        param = getattr(target_module, key_steps[-1])
-                    param.copy_(tensor_value, non_blocking=True)
-
-                elif cp_module is not None and cp_module not in seen_cp_modules:
-                    seen_cp_modules.add(cp_module)
-                    tensor_values = {k: v for k, v in state_dict.items() if cp_prefix in k}
-
-                    # when tensors from ckpt have all the same dtype,
-                    # it can be enforced onto the module parameters
-                    is_single_dtype = (
-                        len(set([v.dtype for v in tensor_values.values()])) == 1
-                    )
-
-                    cp_module._apply(
-                        lambda t: _move_to_real_device(
-                            param=t,
-                            real_device=tensor_value.device,
-                            dtype=(
-                                dtype
-                                if dtype is not None
-                                else tensor_value.dtype
-                                if is_single_dtype
-                                else t.dtype
-                            ),
-                        )
-                    )
-                    unused_keys_cp = cp_module.load_weights(tensor_values)
         except Exception as e:
             # capture error specific to shape mismatch and halt the processing
             if "shape" in str(e) or "size" in str(e):
@@ -750,7 +733,6 @@ def _load_partial_state_dict(
                 unused_keys.update(unused_keys_cp)
             else:
                 unused_keys.add(key)
-
 
     return unused_keys
 

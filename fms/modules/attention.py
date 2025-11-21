@@ -218,6 +218,7 @@ def torch_attn_primitives(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    mask: torch.Tensor,
     scale: Optional[float] = None,
     is_causal: bool = False,
 ) ->     tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -241,7 +242,6 @@ def torch_attn_primitives(
     NOTE: if the model uses RoPE, some care must also be taken that RoPE is properly applied.
     Namely, different CP ranks need to offset their seq idx positions appropriately.
     """
-    #print(q.shape)
     _,n_q_heads, seqlen, d_head = q.shape
     n_k_heads = k.shape[1]
     gqa_ratio, remainder = divmod(n_q_heads, n_k_heads)
@@ -252,7 +252,6 @@ def torch_attn_primitives(
     if gqa_ratio != 1:
         k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
         v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
-
     #dist.barrier()
     #if dist.get_rank() == 0:
     #    print("sclae bef",scale)
@@ -260,8 +259,8 @@ def torch_attn_primitives(
     #scale = scale or d_head ** (0.5)
     scale = 1 /scale
     scores = (q @ k.transpose(-1, -2)) / scale
-    k_nan = torch.isinf(k).any()
-    q_nan = torch.isinf(q).any()
+    #k_nan = torch.isinf(k).any()
+    #q_nan = torch.isinf(q).any()
     #dist.barrier()
     #if dist.get_rank() == 0:
     #    print("scale",scale)
@@ -269,7 +268,9 @@ def torch_attn_primitives(
     #    print("k_inf",k.max())
     #dist.barrier()
     if is_causal:
-        mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device).triu_(1)
+        if mask == None:
+            mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device)
+            mask = torch.triu(mask,diagonal=1)
         scores.masked_fill_(mask[None], float("-inf"))
     max_score = scores.max(dim=-1, keepdim=True).values
     scores = (scores - max_score).exp()
@@ -295,7 +296,6 @@ def _sdpa_compute_op_cp(
         key_cache = key_cache.transpose(2, 1)
         value_cache = value_cache.transpose(2, 1)
     mask = attn_kwargs.get("mask", None)
-
     # TODO: Once we add alibi support, merge rel pos bias and mask into single float mask
     if mask is not None:
         # Our expected mask format is bs x q_len x k_len, so to make it broadcastable
@@ -314,10 +314,6 @@ def _sdpa_compute_op_cp(
     else:
         keys_e = key_cache
         values_e = value_cache
-    #value_nan = torch.isnan(values_e).any()
-    #key_nan = torch.isnan(keys_e).any()
-    #print("value",value_nan)
-    #print("keys",key_nan)
 
     attn_algorithm = attn_kwargs.get("attn_algorithm", None)
     if attn_algorithm:
@@ -338,71 +334,40 @@ def _sdpa_compute_op_cp(
         "is_causal_mask",
         mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
     )
-    numerator, denominator, max_score = torch_attn_primitives(queries,keys_e,values_e, scale_factor, is_causal)
-    #print(queries.shape)
-    #print(keys_e.shape)
-    #print(values_e.shape)
+    numerator, denominator, max_score = torch_attn_primitives(queries,keys_e,values_e, attn_mask,scale_factor,is_causal)
     rank, world_size = distributed.rank_and_world(group)
-    #print("outside:",rank)
     for idx in range(1, world_size):
-        keys_e = all_gather_from_context_parallel_region(keys_e,rank=rank,pg=group)
-        values_e = all_gather_from_context_parallel_region(values_e,rank=rank,pg=group)
-        k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
-        #print("inside",rank)
-        #keys_e = k_blocks[(rank - 1) % world_size]
-        keys_e = k_blocks[rank]
-        v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
-        #values_e = v_blocks[(rank - 1) % world_size]
-        values_e = v_blocks[rank]
-        #value_nan = torch.isnan(values_e).any()
-        #key_nan = torch.isnan(keys_e).any()
-        #print("value",value_nan)
-        #print("keys",key_nan)
-        #k = ring_send_recv(k)
-        #v = ring_send_recv(v)
-        if is_causal and idx > self.rank:
-            # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
-            continue
+        if is_causal: #and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
+            keys_e = all_gather_from_context_parallel_region(keys_e,rank=rank,pg=group)
+            values_e = all_gather_from_context_parallel_region(values_e,rank=rank,pg=group)
+            k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
+            #print("inside",rank)
+            keys_e = k_blocks[(rank - 1) % world_size]
+            #keys_e = k_blocks[idx]
+            #keys_e = k_blocks[rank]
+            v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
+            values_e = v_blocks[(rank - 1) % world_size]
+            #values_e = v_blocks[idx]
 
-        # Update local results
-        ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
-            queries, keys_e, values_e, scale_factor, is_causal=False
-        )
-        #print("max_score",max_score)
-        #print("ring_max_score",ring_max_score)
-        new_max_score = torch.maximum(max_score, ring_max_score)
-        numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
-            max_score - new_max_score
-        ).exp() * numerator
-        denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
-            max_score - new_max_score
-        ).exp() * denominator
-        #dist.barrier()
-        #if dist.get_rank() == 0:
-        #    print("numerator",numerator)
-        #    print("den",denominator)
-        #dist.barrier()
-        #print("power",ring_max_score - new_max_score)
-        #print("exp",(ring_max_score - new_max_score).exp())
-
-
-
-        #numerator = ring_numerator + numerator
-        #denominator = ring_denominator + denominator
-        #value_nan = torch.isnan(numerator).any()
-        #key_nan = torch.isnan(denominator).any()
-        #print("num",value_nan)
-        #print("den",key_nan)
-        max_score = new_max_score
-    value_nan = torch.isnan(numerator).any()
-    key_nan = torch.isnan(denominator).any()
-    #print("num",value_nan)
-    #print("den",key_nan)
+            # Update local results
+            ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
+                queries, keys_e, values_e, attn_mask,scale_factor, is_causal=False
+            )
+            new_max_score = torch.maximum(max_score, ring_max_score)
+            numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
+                max_score - new_max_score
+            ).exp() * numerator
+            denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
+                max_score - new_max_score
+            ).exp() * denominator
+            #dist.barrier()
+            #if dist.get_rank() == 0:
+            #    print("numerator",numerator)
+            #    print("den",denominator)
+            #dist.barrier()
+            max_score = new_max_score
 
     attn = numerator / denominator
-    attn_nan = torch.isnan(attn).any()
-    #print("attn",attn_nan)
-    #return numerator, denominator, max_score
     if attn_algorithm:
         torch.backends.cuda.enable_flash_sdp(__sdpa_previous_flash)
         torch.backends.cuda.enable_mem_efficient_sdp(__sdpa_previous_mem_efficient)
@@ -1002,9 +967,7 @@ class MultiHeadAttention(nn.Module):
         # b x kvlen x h x ds
         # b x h x kvlen x ds
         # todo: Cross attention (This always is true for now)
-        #print("q",q)
         q_out, k_out, v_out = self.in_proj(q, k, v)
-        #print("q_out",q_out)
         # note: transposes will be moved in a later PR to fix dis-contiguous tensor issues
         queries = q_out.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
@@ -1013,18 +976,13 @@ class MultiHeadAttention(nn.Module):
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
             #TODO add cp check
-            rank = distributed.local_rank()
-            #print(rank,q_len)
-            offset = q_len * rank
+            #rank = distributed.local_rank()
+            #offset = q_len * rank
             #print(rank,position_ids.shape)
-            position_ids.add_(offset)
+            #position_ids.add_(offset)
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
-        #query_nan = torch.isnan(queries).any()
-        #key_nan = torch.isnan(keys).any()
-        #print("queries",query_nan)
-        #print("keys",key_nan)
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
         if use_cache:

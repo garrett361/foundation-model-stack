@@ -15,6 +15,9 @@ from fms.modules.attention import (
     MultiHeadAttention,
     get_attention_type,
 )
+from fms.distributed.contextparallel import (
+    all_gather_from_context_parallel_region
+)
 from fms.modules.feedforward import GatedLinearUnit
 from fms.modules.layernorm import LayerNormParameterized
 from fms.modules.linear import get_linear_type
@@ -23,7 +26,6 @@ from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
 from fms.utils.headless import gather_outputs
-
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,8 @@ class GraniteBlock(nn.Module):
         self_attn_past_key_value = past_key_value_state
 
         # first we do MHA and Add&Norm
+        #query_nan = torch.isnan(x).any()
+        #print("queries",query_nan)
         residual = x
         x = self.ln(x)
         x = self.attn(
@@ -173,7 +177,9 @@ class GraniteHeadless(nn.Module):
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
-
+        self.attn_name = None
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            self.attn_name = "cp"
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
         self.max_expected_seq_len = self.config.max_expected_seq_len
@@ -202,6 +208,7 @@ class GraniteHeadless(nn.Module):
         layers = []
         for i in range(self.config.nlayers):
             block: nn.Module = GraniteBlock(self.config, self.rot_emb)
+            #print(self.distributed_strategy)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -284,7 +291,8 @@ class GraniteHeadless(nn.Module):
         # x_in: batch_size x seq_len x emb_dim if input is already embedded, otherwise batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
-        attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_causal_cp")
+        if self.attn_name == "cp":
+            attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_causal_cp")
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
@@ -294,7 +302,9 @@ class GraniteHeadless(nn.Module):
 
         # this is the output cache for all the decoder layers
         present_key_value_states = []
-
+       
+        #query_nan = torch.isnan(x_in).any()
+        #print("queries",query_nan)
         for i, layer in enumerate(self.layers):
             output = layer(
                 x=x_in,
@@ -379,7 +389,9 @@ class Granite(nn.Module):
             past_key_value_states=past_key_value_states,
             **attn_kwargs,
         )
-        if self.distributed_strategy == "cp":
+        #fms.distributed.strategy.ContextParallelStrategy
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            #if self.distributed_strategy == "cp":
             x = self.distributed_strategy.distribute_input(x)
         output, cache = self.base_model(
             x,
@@ -399,6 +411,7 @@ class Granite(nn.Module):
         preds = self.head(output)
         preds = preds / self.config.logits_scaling
 
+        #print(preds.shape)
         if use_cache:
             return preds, cache
         else:

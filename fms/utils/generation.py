@@ -226,7 +226,6 @@ def generate(
             For example: if extra_kwargs contains position_ids and mask keys, these
             model parameters will be updated as-appropriate for each token generated.
     """
-    use_cache = False
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
 
@@ -307,7 +306,7 @@ def generate(
             next_val = torch.multinomial(probs, num_samples=1)
         else:
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
-
+        print(next_val)
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
                 i + prompt_length, logits, next_val, kwargs
