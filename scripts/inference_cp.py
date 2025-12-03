@@ -9,8 +9,8 @@ import random
 import time
 
 # Third Party
-from aiu_fms_testing_utils.utils import aiu_setup, warmup_model
-from aiu_fms_testing_utils.utils.aiu_setup import dprint, rank, local_rank, world_size
+# from aiu_fms_testing_utils.utils import aiu_setup, warmup_model
+# from aiu_fms_testing_utils.utils.aiu_setup import print, rank, local_rank, world_size
 import numpy as np
 import torch
 from torch import distributed as dist
@@ -288,7 +288,7 @@ if args.default_dtype is not None:
 if default_dtype is not None:
     torch.set_default_dtype(default_dtype)
 
-dprint(f"{args}")
+print(f"{args}")
 
 is_aiu_backend = "aiu" in args.device_type
 
@@ -296,7 +296,12 @@ if args.distributed:
     dist.init_process_group()
     # Fix until PT 2.3
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
-    aiu_setup.aiu_dist_setup(dist.get_rank(), dist.get_world_size())
+    # NOTE: @goon - commented out
+    # aiu_setup.aiu_dist_setup(dist.get_rank(), dist.get_world_size())
+
+rank = int(os.environ["RANK"])
+local_rank = int(os.environ["LOCAL_RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
 
 if args.device_type == "cuda":
     device = torch.device(args.device_type, local_rank)
@@ -317,14 +322,14 @@ elif is_aiu_backend:
         if _target_cache_size > torch._dynamo.config.accumulated_cache_size_limit:
             _prev = torch._dynamo.config.accumulated_cache_size_limit
             torch._dynamo.config.accumulated_cache_size_limit = _target_cache_size
-            dprint(
+            print(
                 f"NOTICE: Adjusting torch._dynamo.config.accumulated_cache_size_limit from {_prev} to {torch._dynamo.config.accumulated_cache_size_limit} to accomodate prompt size of {_prompt_size} and decode tokens of {args.max_new_tokens}"
             )
 
     if _target_cache_size > torch._dynamo.config.cache_size_limit:
         _prev = torch._dynamo.config.cache_size_limit
         torch._dynamo.config.cache_size_limit = _target_cache_size
-        dprint(
+        print(
             f"NOTICE: Adjusting torch._dynamo.config.cache_size_limit from {_prev} to {torch._dynamo.config.cache_size_limit} to accomodate prompt size of {_prompt_size} and decode tokens of {args.max_new_tokens}"
         )
 
@@ -364,7 +369,7 @@ if args.deterministic:
     np.random.seed(SEED)  # numpy random seed
     torch.use_deterministic_algorithms(True)
 
-dprint("loading model")
+print("loading model")
 loading_model_time = time.time()
 if args.distributed:
     distr_param = "cp"
@@ -395,7 +400,7 @@ if args.quantization == "gptq":
     qconfig_path = args.model_path + "/quantize_config.json"
     if os.path.exists(qconfig_path):
         with open(qconfig_path, 'r') as f:
-            dprint(f"loading quantization config from {qconfig_path}")
+            print(f"loading quantization config from {qconfig_path}")
             qconfig = json.load(f)
             group_size = qconfig["group_size"]
             desc_act = qconfig["desc_act"]
@@ -404,7 +409,7 @@ if args.quantization == "gptq":
                     "Activation reordering not supported at this time."
                 )
     else:
-        dprint(
+        print(
             "[WARNING] Could not locate quantization config file. "
             "Default configuration will be used."
         )
@@ -464,12 +469,12 @@ elif args.quantization == "int8":
 else:
     linear_config = {"linear_type": "torch_linear"}
 
-dprint("="*60)
-dprint(f"model_path={args.model_path}")
-dprint(f"{linear_config=}")
-dprint(f"{fused_weights=}")
-dprint(f"data_type={default_dtype}")
-dprint("="*60 + "\n")
+print("="*60)
+print(f"model_path={args.model_path}")
+print(f"{linear_config=}")
+print(f"{fused_weights=}")
+print(f"data_type={default_dtype}")
+print("="*60 + "\n")
 
 model = get_model(
     args.architecture,
@@ -508,7 +513,7 @@ if args.cast_bf16_to_fp16:
     for name, param in model.named_parameters():
         if param.dtype == torch.bfloat16:
             if param.max() > torch.finfo(torch.float16).max:
-                dprint(f"[WARNING] You are casting param {name} to fp16, which will cause loss of accuracy. You can ignore this warning if this is intended.")
+                print(f"[WARNING] You are casting param {name} to fp16, which will cause loss of accuracy. You can ignore this warning if this is intended.")
             param.data = param.data.to(dtype=torch.float16)
 
 if args.cast_fp16_to_bf16:
@@ -518,22 +523,22 @@ if args.cast_fp16_to_bf16:
 
 if args.quantization in ["gptq", "int8"]:
     if rank == 0 and args.verbose > 0:
-        dprint("PARAMS:\n" + "\n".join(f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}" for k,v in model.named_parameters()))
-        dprint("BUFFERS:\n" + "\n".join(f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}" for k,v in model.named_buffers()))
-        dprint("="*60 + "\n")
+        print("PARAMS:\n" + "\n".join(f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}" for k,v in model.named_parameters()))
+        print("BUFFERS:\n" + "\n".join(f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}" for k,v in model.named_buffers()))
+        print("="*60 + "\n")
     if args.architecture == "llama":
-        dprint("[NOTE] In Llama models, it's OK for bias and rotary embeddings to be marked as unused keys.")
-    dprint(model)
-    dprint("="*60 + "\n")
+        print("[NOTE] In Llama models, it's OK for bias and rotary embeddings to be marked as unused keys.")
+    print(model)
+    print("="*60 + "\n")
 
 tokenizer = tokenizers.get_tokenizer(args.tokenizer)
 model.eval()
 torch.set_grad_enabled(False)
 loading_model_time = time.time() - loading_model_time
-dprint(f"loading complete, took {loading_model_time:.3f}s")
+print(f"loading complete, took {loading_model_time:.3f}s")
 
 if args.compile:
-    dprint("compiling model")
+    print("compiling model")
     if is_aiu_backend:
         model.compile(backend="sendnn", options={'sendnn.dynamic': args.compile_dynamic_sendnn})
     else:
@@ -556,7 +561,7 @@ def truncate_prompts_to_max_length(prompts, max_len, max_allowed_length):
     # we may want the prompt length to be fixed to some max length
     # this will ensure that prior to padding the input ids
     if max_allowed_length is not None and max_len > max_allowed_length:
-        dprint(f"max prompt length is {max_len}, truncating to {max_allowed_length}")
+        print(f"max prompt length is {max_len}, truncating to {max_allowed_length}")
         prompts = [prompt[:max_allowed_length] for prompt in prompts]
     return prompts
 
@@ -626,7 +631,7 @@ else:
             "Write a simple decorator in python which will modify all string inputs to ints if possible."
         )
     else:
-        dprint("prompt_type must be one of chat or code")
+        print("prompt_type must be one of chat or code")
         exit()
 
     prompt1 = ids_for_prompt(prompt1)
@@ -648,7 +653,7 @@ has_padding = args.batch_size > 1 or padding_length != 0
 max_len = max([len(prompt) for prompt in prompts])
 print([len(prompt) for prompt in prompts])
 if args.fixed_prompt_length != 0 and args.fixed_prompt_length < max_len:
-    dprint(
+    print(
         f"One or more prompts require truncation. Truncation has been disabled as fixed_prompt_length has been set."
     )
     exit(1)
@@ -688,7 +693,7 @@ def print_result(result, result_idx: int):
             file_path = output_path / f"{result_idx}.txt"
             with file_path.open("w", encoding="utf-8") as file:
                 file.write(output_str + "\n")
-    dprint(output_str)
+    print(output_str)
     print()
 
 
@@ -697,8 +702,8 @@ def infer(use_cache, do_sample, warmup):
     # There is currently a bug in start_pos for batched rotary embeddings that can lead
     # varying results for the same prompt.
     if local_rank == 0 and not warmup:
-        dprint(f"use_cache {use_cache};; do_sample {do_sample}")
-        dprint("==================")
+        print(f"use_cache {use_cache};; do_sample {do_sample}")
+        print("==================")
 
     # Add only_last_token optimization
     global extra_generation_kwargs
@@ -729,18 +734,18 @@ def infer(use_cache, do_sample, warmup):
     #if args.timing != "":
     #    result, timings = result
     #    if args.timing == "e2e":
-    #        dprint(f"E2E timing information: {timings[0]:.3f}s")
+    #        print(f"E2E timing information: {timings[0]:.3f}s")
     #    elif args.timing == "per-token":
     #        if not warmup:
-    #            dprint(f"First-token latency: {timings[0]*1000:.3f} ms")
-    #            dprint(f"Average next-token latency (including first token): {np.mean(timings)*1000:.3f} ms")
+    #            print(f"First-token latency: {timings[0]*1000:.3f} ms")
+    #            print(f"Average next-token latency (including first token): {np.mean(timings)*1000:.3f} ms")
     #            if len(timings) > 1:
-    #                dprint(f"Average next-token latency: {np.mean(timings[1:])*1000:.3f} ms")
-    #                dprint(f"Max next-token latency: {np.max(timings[1:])*1000:.3f} ms (token #{np.argmax(timings[1:]) + 2})")
-    #                dprint(f"Min next-token latency: {np.min(timings[1:])*1000:.3f} ms (token #{np.argmin(timings[1:]) + 2})")
-    #                dprint(f"Std deviation of next-token latencies: {np.std(timings[1:])*1000:.3f} ms")
+    #                print(f"Average next-token latency: {np.mean(timings[1:])*1000:.3f} ms")
+    #                print(f"Max next-token latency: {np.max(timings[1:])*1000:.3f} ms (token #{np.argmax(timings[1:]) + 2})")
+    #                print(f"Min next-token latency: {np.min(timings[1:])*1000:.3f} ms (token #{np.argmin(timings[1:]) + 2})")
+    #                print(f"Std deviation of next-token latencies: {np.std(timings[1:])*1000:.3f} ms")
     #        timings = [f"{t*1000:.3f}" for t in timings]
-    #        dprint(f"Per-token timing information: {', '.join(timings)} ms")
+    #        print(f"Per-token timing information: {', '.join(timings)} ms")
     if len(result.shape) == 1:
         result = result.unsqueeze(0)
 
@@ -756,7 +761,7 @@ use_cache = [
 ]  # True/False are identical with greedy iff `torch.use_deterministic_algorithms(True)`
 
 if args.compile:
-    dprint(f"compilation warmup")
+    print(f"compilation warmup")
     pt_compile_model_time = time.time()
     if args.device_type == "aiu":  # only run warmup for AIU, no need for senulator
         for cache in use_cache:
@@ -765,14 +770,14 @@ if args.compile:
         for sample, cache in itertools.product(do_sample, use_cache):
             infer(cache, sample, True)
         aiu_warmup_time = time.time() - aiu_warmup_time
-        dprint(f"AIU warmup complete, took {aiu_warmup_time:.3f}s")
+        print(f"AIU warmup complete, took {aiu_warmup_time:.3f}s")
     else:
         for sample, cache in itertools.product(do_sample, use_cache):
             infer(cache, sample, True)
     pt_compile_model_time = time.time() - pt_compile_model_time
-    dprint(f"PT compile complete, took {pt_compile_model_time:.3f}s")
+    print(f"PT compile complete, took {pt_compile_model_time:.3f}s")
 
-dprint(f"generating output")
+print(f"generating output")
 
 for sample, cache in itertools.product(do_sample, use_cache):
     for _ in range(args.iters):
