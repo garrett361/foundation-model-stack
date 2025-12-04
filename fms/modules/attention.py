@@ -252,21 +252,8 @@ def torch_attn_primitives(
     if gqa_ratio != 1:
         k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
         v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
-    #dist.barrier()
-    #if dist.get_rank() == 0:
-    #    print("sclae bef",scale)
-    #dist.barrier()
-    #scale = scale or d_head ** (0.5)
     scale = 1 /scale
     scores = (q @ k.transpose(-1, -2)) / scale
-    #k_nan = torch.isinf(k).any()
-    #q_nan = torch.isinf(q).any()
-    #dist.barrier()
-    #if dist.get_rank() == 0:
-    #    print("scale",scale)
-    #    print("q_inf",q.max())
-    #    print("k_inf",k.max())
-    #dist.barrier()
     if is_causal:
         if mask == None:
             mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device)
@@ -336,18 +323,15 @@ def _sdpa_compute_op_cp(
     )
     numerator, denominator, max_score = torch_attn_primitives(queries,keys_e,values_e, attn_mask,scale_factor,is_causal)
     rank, world_size = distributed.rank_and_world(group)
-    for idx in range(1, world_size):
+    for idx in range(0, world_size-1):
         if is_causal: #and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
+            #     # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
             keys_e = all_gather_from_context_parallel_region(keys_e,rank=rank,pg=group)
             values_e = all_gather_from_context_parallel_region(values_e,rank=rank,pg=group)
             k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
-            #print("inside",rank)
-            keys_e = k_blocks[(rank - 1) % world_size]
-            #keys_e = k_blocks[idx]
-            #keys_e = k_blocks[rank]
+            keys_e = k_blocks[idx]
             v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
-            values_e = v_blocks[(rank - 1) % world_size]
-            #values_e = v_blocks[idx]
+            values_e = v_blocks[idx]
 
             # Update local results
             ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
@@ -360,11 +344,6 @@ def _sdpa_compute_op_cp(
             denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
                 max_score - new_max_score
             ).exp() * denominator
-            #dist.barrier()
-            #if dist.get_rank() == 0:
-            #    print("numerator",numerator)
-            #    print("den",denominator)
-            #dist.barrier()
             max_score = new_max_score
 
     attn = numerator / denominator
@@ -957,8 +936,6 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
-        #print(use_cache)
-        #print(q.size())
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
         # if we dont have the cache yet, we need to compute
@@ -974,15 +951,15 @@ class MultiHeadAttention(nn.Module):
         values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
         # You want to apply rotary embeddings pre-cache
-        if self.position_encoder is not None:
-            #TODO add cp check
-            #rank = distributed.local_rank()
-            #offset = q_len * rank
-            #print(rank,position_ids.shape)
-            #position_ids.add_(offset)
-            queries, keys = self.position_encoder.adjusted_qk(
-                queries, keys, position_ids, past_key_value_state, use_cache
-            )
+        #if self.position_encoder is not None:
+        #    #TODO add cp check
+        #    rank = distributed.local_rank()
+        #    offset = q_len * rank
+        #    #print(rank,position_ids.shape)
+        #    position_ids.add_(offset)
+        #    queries, keys = self.position_encoder.adjusted_qk(
+        #        queries, keys, position_ids, past_key_value_state, use_cache
+        #    )
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
         if use_cache:
@@ -1000,10 +977,6 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             keys_compute, values_compute = keys, values
-        #value_nan = torch.isnan(values_compute).any()
-        #key_nan = torch.isnan(keys_compute).any()
-        #print("value",value_nan)
-        #print("keys",key_nan)
 
         updated_attn_kwargs: Union[AttentionKwargs, SinkAttentionKwargs]
 
@@ -1039,8 +1012,6 @@ class MultiHeadAttention(nn.Module):
                 self.group,
                 **updated_attn_kwargs,
             )
-            #attn_nan = torch.isnan(attn).any()
-            #print("attn",attn_nan)
         else:
             attn = attn_compute_dict["compute_decode"](
                 queries,
@@ -1339,7 +1310,6 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
                     0,
                     [self.pre_cp_nheads, self.pre_cp_kvheads, self.pre_cp_kvheads],
                 ),
-                #"dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
                 "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
             }
         else:
@@ -1388,27 +1358,6 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
         )
         return cp_mha
 
-    #def _copy_to_cp_region(
-    #    self,
-    #    q: torch.Tensor,
-    #    k: Optional[torch.Tensor] = None,
-    #    v: Optional[torch.Tensor] = None,
-    #):
-    #    if (k is None and v is None) or (k is q and v is q):
-    #        q_par = copy_to_tensor_model_parallel_region(q, self.group)
-    #        if self.fused:
-    #            k_par = None
-    #            v_par = None
-    #        else:
-    #            k_par = copy_to_tensor_model_parallel_region(k, self.group)
-    #            v_par = copy_to_tensor_model_parallel_region(v, self.group)
-    #    else:
-    #        raise ValueError(
-    #            "both k and v must either be given as tensors or both None"
-    #        )
-
-    #    return q_par, k_par, v_par
-
     def forward(
         self,
         q: torch.Tensor,
@@ -1422,14 +1371,8 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
         """
         Check MultiHeadAttention for up-to-date arguments and docs
         """
-        #print(self.rank,q.shape)
-        #print(self.rank,k.shape)
-
-        #q_par, k_par, v_par = self._copy_to_cp_region(q, k, v)
         q_par, k_par, v_par = q,k,v
-        #attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_causal_cp")
         attn_kwargs["attn_name"] = "sdpa_causal_cp"
-        #numerator, denominator, max_score = MultiHeadAttention.forward(
         out = MultiHeadAttention.forward(
             self,
             q_par,
@@ -1440,8 +1383,6 @@ class CPMultiHeadAttention(MultiHeadAttention, CPModule):
             use_cache,
             **attn_kwargs,
         )
-        #numerator, denominator, max_score = torch_attn_primitives(q, k, v, self.scale_factor, is_causal=True)
-
         return out
         #TODO handle caching
         # if use_cache=True, we return the hidden_state as well as the kv cache.

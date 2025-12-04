@@ -6,7 +6,7 @@ from torch import nn
 
 from fms.modules import UninitializedModule
 from fms.modules.tp import ShardType, TPModule
-from fms.modules.cp import ShardType, CPModule
+from fms.modules.cp import CPModule
 
 __type_factory_map: dict[str, Callable] = {}
 __type_sharding_map: dict[str, Callable] = {}
@@ -183,12 +183,10 @@ def shard_base_linear(
     all_params: dict = {}
     used_keys: set[str] = set()
     unused_keys: set[str] = set()
-
     # Collect all parameters to be copied on selected sharded modules
     param_count = 0
     for module_name in module_sharding_info:
         for param_name in param_sharding_info[module_name]:
-            #print("in linear",module_name,param_name)
             if module_name not in all_params:
                 all_params[module_name] = {}
             all_params[module_name][param_name] = tp_module._get_sd_weight(
@@ -231,16 +229,28 @@ def shard_torch_linear(
     param_sharding_info: dict[str, dict[str, LinearParameterShardingInfo]] = {}
     for module_name, module_info in module_sharding_info.items():
         linear_mod: torch.nn.Module = module_info.linear_module
-        params: dict[str, LinearParameterShardingInfo] = {
-            "weight": LinearParameterShardingInfo(
-                module_info.sharding_dim, ShardType.SHARD
-            )
-        }
-        if hasattr(linear_mod, "bias") and linear_mod.bias is not None:
-            params["bias"] = LinearParameterShardingInfo(
-                module_info.sharding_dim,
-                ShardType.SHARD if module_info.sharding_dim == 0 else ShardType.RANK0,
-            )
+        if tp_module.__class__.__name__ == "CPModule":
+            params: dict[str, LinearParameterShardingInfo] = {
+                "weight": LinearParameterShardingInfo(
+                    module_info.sharding_dim, ShardType.CLONE
+                )
+            }
+            if hasattr(linear_mod, "bias") and linear_mod.bias is not None:
+                params["bias"] = LinearParameterShardingInfo(
+                    module_info.sharding_dim,
+                    ShardType.CLONE if module_info.sharding_dim == 0 else ShardType.RANK0,
+                )
+        else:
+            params: dict[str, LinearParameterShardingInfo] = {
+                "weight": LinearParameterShardingInfo(
+                    module_info.sharding_dim, ShardType.SHARD
+                )
+            }
+            if hasattr(linear_mod, "bias") and linear_mod.bias is not None:
+                params["bias"] = LinearParameterShardingInfo(
+                    module_info.sharding_dim,
+                    ShardType.SHARD if module_info.sharding_dim == 0 else ShardType.RANK0,
+                )
         param_sharding_info[module_name] = params
 
     unused_keys = shard_base_linear(
