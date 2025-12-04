@@ -25,7 +25,6 @@ from fms.modules.positions import RotaryEmbedding
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
-from fms.utils.headless import gather_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +126,6 @@ class GraniteBlock(nn.Module):
         self_attn_past_key_value = past_key_value_state
 
         # first we do MHA and Add&Norm
-        #query_nan = torch.isnan(x).any()
-        #print("queries",query_nan)
         residual = x
         x = self.ln(x)
         x = self.attn(
@@ -206,7 +203,6 @@ class GraniteHeadless(nn.Module):
         layers = []
         for i in range(self.config.nlayers):
             block: nn.Module = GraniteBlock(self.config, self.rot_emb)
-            #print(self.distributed_strategy)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -301,8 +297,6 @@ class GraniteHeadless(nn.Module):
         # this is the output cache for all the decoder layers
         present_key_value_states = []
        
-        #query_nan = torch.isnan(x_in).any()
-        #print("queries",query_nan)
         for i, layer in enumerate(self.layers):
             output = layer(
                 x=x_in,
@@ -389,7 +383,6 @@ class Granite(nn.Module):
         )
         #fms.distributed.strategy.ContextParallelStrategy
         if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
-            #if self.distributed_strategy == "cp":
             x = self.distributed_strategy.distribute_input(x)
         output, cache = self.base_model(
             x,
@@ -398,14 +391,12 @@ class Granite(nn.Module):
             use_cache,
             **attn_kwargs,
         )
-        #print(output.shape)
-        #torch.save(output, '/home/senuser/opg_1cpu.pt')
+        output = self.distributed_strategy.gather_tensor(output)
         if only_last_token:
             output = output[:, -1, :]
         preds = self.head(output)
         preds = preds / self.config.logits_scaling
 
-        #print(preds.shape)
         if use_cache:
             return preds, cache
         else:

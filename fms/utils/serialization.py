@@ -538,7 +538,6 @@ def load_state_dict_into_model(
             if key in used_keys:
                 continue
             used_keys.add(key)
-            #print(used_keys)
 
             partial_sd = {key: state_dict[key]}
             # Find neighbors to the key. If the adapter requires a neighbor and
@@ -650,9 +649,6 @@ def _load_partial_state_dict(
 
         # Check if target_module has the Parameter/buffer
         try:
-            #if distributed_strategy == 'tp':
-                # If TP sharding is not needed, copy the parameter
-                # into the model
             if (not needs_tp_sharding and not needs_cp_sharding) or (tp_module is None and cp_module is None):
                 param = getattr(target_module, key_steps[-1])
 
@@ -714,6 +710,7 @@ def _load_partial_state_dict(
                     )
                 )
                 unused_keys_cp = cp_module.load_weights(tensor_values)
+
 
         except Exception as e:
             # capture error specific to shape mismatch and halt the processing

@@ -646,7 +646,7 @@ else:
 
 has_padding = args.batch_size > 1 or padding_length != 0
 max_len = max([len(prompt) for prompt in prompts])
-
+print([len(prompt) for prompt in prompts])
 if args.fixed_prompt_length != 0 and args.fixed_prompt_length < max_len:
     dprint(
         f"One or more prompts require truncation. Truncation has been disabled as fixed_prompt_length has been set."
@@ -655,6 +655,7 @@ if args.fixed_prompt_length != 0 and args.fixed_prompt_length < max_len:
 prompts = truncate_prompts_to_max_length(prompts, max_len, max_allowed_length)
 if has_padding:
     ids, extra_generation_kwargs = pad_input_ids(prompts, min_pad_length=padding_length)
+    #ids, extra_generation_kwargs = pad_input_ids(prompts, min_pad_length=42)
 else:
     ids = prompts
     if isinstance(ids, list) and len(ids) == 1:
@@ -744,6 +745,7 @@ def infer(use_cache, do_sample, warmup):
         result = result.unsqueeze(0)
 
     if not warmup:
+        print("result.shape",result.shape)
         for i in range(result.shape[0]):
             print_result(result[i], i)
 

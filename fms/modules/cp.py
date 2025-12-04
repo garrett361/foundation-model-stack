@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Set, Union
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-
+from fms.modules.tp import ShardType
 
 def _get_cpd_module(module: nn.Module, attr_name: str):
     if attr_name == "self":
@@ -13,10 +13,10 @@ def _get_cpd_module(module: nn.Module, attr_name: str):
     return getattr(module, attr_name)
 
 
-class ShardType(Enum):
-    SHARD = 1
-    RANK0 = 2
-    CLONE = 3
+#class ShardType(Enum):
+#    SHARD = 1
+#    RANK0 = 2
+#    CLONE = 3
 
 
 class CPModule(nn.Module, metaclass=ABCMeta):

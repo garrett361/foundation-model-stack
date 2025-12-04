@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from fms.modules.ssm import SSMCacheUnit
+from fms import distributed
+from fms.distributed.contextparallel import (
+    all_gather_from_context_parallel_region
+)
 
 
 logger = logging.getLogger(__name__)
@@ -269,9 +273,7 @@ def generate(
             input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
 
         output = model(input_ids, **kwargs)
-        #torch.save(output, 'op_cp.pt')
-        #print(output)
-        #break
+        dr = distributed.local_rank()
         if use_cache:
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
@@ -302,14 +304,14 @@ def generate(
             next_val = torch.multinomial(probs, num_samples=1)
         else:
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
-        print(next_val)
+        print(dr,next_val)
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
                 i + prompt_length, logits, next_val, kwargs
             )
 
+        #torch.save(result, '/home/senuser/nv_cp.pt')
         result = torch.cat((result, next_val), dim=-1)
-        #torch.save(result, 'op_cp_t1.pt')
 
         # avoid continuing to generate if all have reached EOS
         if eos_token_id is not None:
@@ -331,7 +333,6 @@ def generate(
 
         if eos_reached:
             break
-        #print(output)
         break
 
     if timing == "e2e":
