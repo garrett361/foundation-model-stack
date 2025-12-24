@@ -386,6 +386,10 @@ class Granite(nn.Module):
         #fms.distributed.strategy.ContextParallelStrategy
         if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
             x = self.distributed_strategy.distribute_input(x)
+            if attn_kwargs["mask"] != None:
+                attn_kwargs["mask"] = self.distributed_strategy.distribute_input(attn_kwargs["mask"])
+            if position_ids != None:
+                position_ids = self.distributed_strategy.distribute_input(position_ids)
         output, cache = self.base_model(
             x,
             position_ids,
@@ -394,7 +398,16 @@ class Granite(nn.Module):
             **attn_kwargs,
         )
 
-        output = self.distributed_strategy.gather_tensor(output)
+        # TODO: The class-name guard below is a workaround for an incomplete `gather_tensor` API.
+        # `_gather_tensor` is declared `@abstractmethod` on `DistributedStrategy` but
+        # `NotDistributed` and `TensorParallelStrategy` never implement it — calling it on those
+        # strategies returns `None` (the base-class `pass`). The right fix is to give the base
+        # class a no-op default (`return model_input`) so every strategy is safe to call
+        # unconditionally, and replace the fragile `__class__.__name__` check with either
+        # `isinstance(self.distributed_strategy, ContextParallelStrategy)` or just the no-op
+        # default.
+        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
+            output = self.distributed_strategy.gather_tensor(output)
         # TODO: The original cp-clean commits had `if only_last_token: output = output[:, -1, :]`
         # here, but `only_last_token` was never a parameter of this forward() — NameError at
         # runtime. Upstream PR #470 (71eb2ea5) introduced `gather_outputs` which supersedes that

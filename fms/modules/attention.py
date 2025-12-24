@@ -951,15 +951,15 @@ class MultiHeadAttention(nn.Module):
         values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
         # You want to apply rotary embeddings pre-cache
-        #if self.position_encoder is not None:
-        #    #TODO add cp check
-        #    rank = distributed.local_rank()
-        #    offset = q_len * rank
-        #    #print(rank,position_ids.shape)
-        #    position_ids.add_(offset)
-        #    queries, keys = self.position_encoder.adjusted_qk(
-        #        queries, keys, position_ids, past_key_value_state, use_cache
-        #    )
+        if self.position_encoder is not None:
+            #TODO add cp check
+            #rank = distributed.local_rank()
+            #offset = q_len * rank
+            #print(rank,position_ids.shape)
+            #position_ids.add_(offset)
+            queries, keys = self.position_encoder.adjusted_qk(
+                queries, keys, position_ids, past_key_value_state, use_cache
+            )
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
         if use_cache:
