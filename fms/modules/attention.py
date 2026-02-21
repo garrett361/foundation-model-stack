@@ -35,7 +35,6 @@ from fms.modules.linear import (
 )
 from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
-from fms.modules.cp import CPModule
 
 __sdpa_previous_flash: bool = torch.backends.cuda.flash_sdp_enabled()
 __sdpa_previous_mem_efficient: bool = torch.backends.cuda.mem_efficient_sdp_enabled()
@@ -1075,7 +1074,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             return out
 
 
-class CPMultiHeadAttention(MultiHeadAttention, CPModule):
+class CPMultiHeadAttention(MultiHeadAttention):
     """
     Performs multi-headed self- or cross-attention, with optional attention masking.
     This subclass adds support for Tensor Parallel
