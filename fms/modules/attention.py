@@ -823,11 +823,6 @@ class MultiHeadAttention(nn.Module):
 
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
-            #TODO add cp check
-            #rank = distributed.local_rank()
-            #offset = q_len * rank
-            #print(rank,position_ids.shape)
-            #position_ids.add_(offset)
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
@@ -1149,6 +1144,12 @@ class CPMultiHeadAttention(MultiHeadAttention):
     ):
         if use_cache:
             raise NotImplementedError("KV cache not yet supported with CP")
+
+        # Offset position_ids so each CP rank uses global sequence positions
+        if position_ids is not None:
+            offset = q.size(1) * self.cp_rank
+            position_ids = position_ids + offset
+
         attn_kwargs["attn_name"] = "sdpa_causal_cp"
         return MultiHeadAttention.forward(
             self, q, k, v, position_ids, past_key_value_state, use_cache,
