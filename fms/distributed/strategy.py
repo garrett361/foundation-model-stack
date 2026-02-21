@@ -76,18 +76,11 @@ class DistributedStrategy:
         """
         pass
 
-    @abstractmethod
-    def _distribute_input(self, model_input:torch.LongTensor):
-        """
-        Distribute each layer
-        """
-        pass
-    @abstractmethod
-    def _gather_tensor(self, model_input:torch.LongTensor):
-        """
-        Gather from each rank
-        """
-        pass
+    def _distribute_input(self, model_input: torch.Tensor) -> torch.Tensor:
+        return model_input
+
+    def _gather_tensor(self, model_input: torch.Tensor) -> torch.Tensor:
+        return model_input
 
 
 class NotDistributed(DistributedStrategy):
@@ -192,6 +185,7 @@ class ContextParallelStrategy(DistributedStrategy):
         super().__init__(from_meta)
         assert torch.distributed.is_initialized(), "must initialize a process group"
         self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+        self.original_size: int | None = None
 
     def _distribute_module(
         self, module: nn.Module, final_layers: bool = False
@@ -201,9 +195,14 @@ class ContextParallelStrategy(DistributedStrategy):
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return cp_wrapping.apply_layer_cp(block, self.group)
 
-    def _distribute_input(self,model_input:torch.LongTensor):
-        return cp_wrapping.apply_input_cp(model_input, self.group)
+    def _distribute_input(self, model_input: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        chunk, self.original_size = cp_wrapping.apply_input_cp(
+            model_input, self.group, dim=dim
+        )
+        return chunk
 
-    def _gather_tensor(self,model_input:torch.LongTensor):
-        return cp_wrapping.apply_gather_tensor_cp(model_input, self.group)
+    def _gather_tensor(self, model_input: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        return cp_wrapping.apply_gather_tensor_cp(
+            model_input, self.group, dim=dim, original_size=self.original_size
+        )
 

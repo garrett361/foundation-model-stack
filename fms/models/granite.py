@@ -384,13 +384,15 @@ class Granite(nn.Module):
             past_key_value_states=past_key_value_states,
             **attn_kwargs,
         )
-        #fms.distributed.strategy.ContextParallelStrategy
-        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
-            x = self.distributed_strategy.distribute_input(x)
-            if attn_kwargs["mask"] != None:
-                attn_kwargs["mask"] = self.distributed_strategy.distribute_input(attn_kwargs["mask"])
-            if position_ids != None:
-                position_ids = self.distributed_strategy.distribute_input(position_ids)
+
+        x = self.distributed_strategy.distribute_input(x)
+        if attn_kwargs.get("mask") is not None:
+            attn_kwargs["mask"] = self.distributed_strategy.distribute_input(
+                attn_kwargs["mask"]
+            )
+        if position_ids is not None:
+            position_ids = self.distributed_strategy.distribute_input(position_ids)
+
         output, cache = self.base_model(
             x,
             position_ids,
@@ -399,9 +401,7 @@ class Granite(nn.Module):
             **attn_kwargs,
         )
 
-        if self.distributed_strategy.__class__.__name__ == "ContextParallelStrategy":
-            output = self.distributed_strategy.gather_tensor(output)
-
+        output = self.distributed_strategy.gather_tensor(output)
         output = gather_outputs(output, last_n_tokens, **attn_kwargs)
         preds = self.head(output)
         preds = preds / self.config.logits_scaling
