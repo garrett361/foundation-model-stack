@@ -1076,17 +1076,11 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
 
 class CPMultiHeadAttention(MultiHeadAttention):
     """
-    Performs multi-headed self- or cross-attention, with optional attention masking.
-    This subclass adds support for Tensor Parallel
-    ...
-    Args
-    ----
-    Check MultiHeadAttention for up-to-date docs
+    Multi-headed attention with context parallel support.
 
-    world_size: int
-        the number of processes running this model in TP
-    rank: int
-        the index of this process wrt to the rest running the model in TP
+    No head sharding: the full model exists on every rank. Only the sequence
+    dimension is split across the CP group, and the ring attention loop in
+    _sdpa_compute_op_cp handles the cross-rank KV communication.
     """
 
     def __init__(
@@ -1105,23 +1099,14 @@ class CPMultiHeadAttention(MultiHeadAttention):
         scale_factor: Optional[float] = None,
     ):
         assert torch.distributed.is_initialized()
-
         rank, world_size = distributed.rank_and_world(group)
-        assert nheads % world_size == 0, (
-            "The number of heads must be divisible by world size"
-        )
-        assert (kvheads >= world_size and kvheads % world_size == 0) or (
-            kvheads < world_size and world_size % kvheads == 0
-        ), (
-            "the kv heads must be divisible by the world size or the world size must be divisible by kv heads"
-        )
         MultiHeadAttention.__init__(
             self,
             emb_dim,
             emb_kq,
             emb_v,
-            nheads // world_size,
-            (kvheads // world_size) if kvheads >= world_size else 1,
+            nheads,
+            kvheads,
             p_dropout,
             use_bias,
             position_encoder,
@@ -1130,67 +1115,15 @@ class CPMultiHeadAttention(MultiHeadAttention):
             scale_factor,
             group,
         )
-        self.pre_cp_nheads = nheads
-        self.pre_cp_kvheads = kvheads
-        self.setup_cp(rank, group)
-
-    def load_weights(
-        self,
-        tensor_values: dict[str, torch.Tensor],
-    ) -> Optional[set]:
-        """Define sharding info of MHA module as:
-        {'module_name': (module_obj, sharding_dim, max_partition)}
-        Then, call the pre-registered sharding function associated with
-        self.linear_type.
-
-        `sharding_dim` is sharding dimension of the `weights` parameter
-        of nn.Linear. It may differ for other types of linear or other
-        parameters.
-
-        The numbers in `max_partition` signify the largest world size
-        till we need to duplicate. For instance if we have nheads=16 and
-        world_size=32, then first 2 ranks will get first 1/16th of query
-        """
-        if self.fused:
-            module_sharding_info = {
-                "qkv_fused": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("qkv_fused"),
-                    0,
-                    [self.pre_cp_nheads, self.pre_cp_kvheads, self.pre_cp_kvheads],
-                ),
-                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
-            }
-        else:
-            module_sharding_info = {
-                "query": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("query"), 0, [self.pre_cp_nheads]
-                ), #0
-                "key": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("key"), 0, [self.pre_cp_kvheads]
-                ), #0
-                "value": LinearModuleShardingInfo(
-                    self.in_proj.get_submodule("value"), 0, [self.pre_cp_kvheads]
-                ), #0
-                "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),#0
-            }
-
-        type_sharding_map = get_all_linear_type_to_sharding_maps()
-
-        # TODO: Remove assumption that all layers in module share quantization
-        module_name = getattr(self.dense, "module_name", None)
-        linear_type = get_linear_type(self.linear_config, module_name)
-        unused_keys = type_sharding_map[linear_type](
-            tensor_values,
-            self,
-            module_sharding_info,
-        )
-        return unused_keys
+        self.cp_rank = rank
+        self.cp_world_size = world_size
+        self.cp_group = group if group is not None else dist.group.WORLD
 
     @staticmethod
     def import_module(
         mha: MultiHeadAttention, group: ProcessGroup
     ) -> "CPMultiHeadAttention":
-        cp_mha = CPMultiHeadAttention(
+        return CPMultiHeadAttention(
             emb_dim=mha.emb_dim,
             emb_kq=mha.emb_kq_per_head,
             emb_v=mha.emb_v_per_head,
@@ -1204,7 +1137,6 @@ class CPMultiHeadAttention(MultiHeadAttention):
             linear_config=mha.linear_config,
             scale_factor=mha.scale_factor,
         )
-        return cp_mha
 
     def forward(
         self,
@@ -1216,28 +1148,10 @@ class CPMultiHeadAttention(MultiHeadAttention):
         use_cache=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
-        """
-        Check MultiHeadAttention for up-to-date arguments and docs
-        """
-        q_par, k_par, v_par = q,k,v
+        if use_cache:
+            raise NotImplementedError("KV cache not yet supported with CP")
         attn_kwargs["attn_name"] = "sdpa_causal_cp"
-        out = MultiHeadAttention.forward(
-            self,
-            q_par,
-            k_par,
-            v_par,
-            position_ids,
-            past_key_value_state,
-            use_cache,
+        return MultiHeadAttention.forward(
+            self, q, k, v, position_ids, past_key_value_state, use_cache,
             **attn_kwargs,
         )
-        return out
-        #TODO handle caching
-        # if use_cache=True, we return the hidden_state as well as the kv cache.
-        # We only reduce the output, and keep the cache thread-local
-        #if use_cache:
-        #    out = reduce_from_tensor_model_parallel_region(out_par[0], self.group)
-        #    return out, out_par[1]
-        #else:
-        #    out = reduce_from_tensor_model_parallel_region(out_par, self.group)
-        #    return out
