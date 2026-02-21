@@ -192,10 +192,10 @@ def torch_attn_primitives(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: torch.Tensor,
-    scale: Optional[float] = None,
+    mask: Optional[torch.Tensor],
+    scale: float,
     is_causal: bool = False,
-) ->     tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns the softmax numerator, denominator, and max scale. These are primitive values which can
     be used to build normal softmax attention and ring attention.
@@ -216,7 +216,7 @@ def torch_attn_primitives(
     NOTE: if the model uses RoPE, some care must also be taken that RoPE is properly applied.
     Namely, different CP ranks need to offset their seq idx positions appropriately.
     """
-    _,n_q_heads, seqlen, d_head = q.shape
+    _, n_q_heads, seqlen, d_head = q.shape
     n_k_heads = k.shape[1]
     gqa_ratio, remainder = divmod(n_q_heads, n_k_heads)
     if remainder:
@@ -226,12 +226,11 @@ def torch_attn_primitives(
     if gqa_ratio != 1:
         k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
         v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
-    scale = 1 /scale
-    scores = (q @ k.transpose(-1, -2)) / scale
+    scores = (q @ k.transpose(-1, -2)) * scale
     if is_causal:
-        if mask == None:
+        if mask is None:
             mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device)
-            mask = torch.triu(mask,diagonal=1)
+            mask = torch.triu(mask, diagonal=1)
         scores.masked_fill_(mask[None], float("-inf"))
     max_score = scores.max(dim=-1, keepdim=True).values
     scores = (scores - max_score).exp()
