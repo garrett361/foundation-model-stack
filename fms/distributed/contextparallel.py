@@ -6,73 +6,46 @@ import torch.distributed._functional_collectives as funcol
 
 
 def _all_gather(input_: torch.Tensor, pg: dist.ProcessGroup) -> torch.Tensor:
-    """Gather the input tensor across model parallel group."""
-
+    """Gather the input tensor across the context parallel group."""
     if pg.size() == 1:
         return input_
-
-    # The transposes here are to avoid excessive recompilation due to split()
-    # specializing the dimension where the all_gather is happening
-    last_dim = input_.dim() - 1
-    return (
-        funcol.all_gather_tensor(
-            input_.contiguous(),
-            gather_dim=0,
-            group=pg)
-    )
+    return funcol.all_gather_tensor(input_.contiguous(), gather_dim=0, group=pg)
 
 
-def _all_reduce(input_: torch.Tensor, pg: dist.ProcessGroup) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
-
+def _split(
+    input_: torch.Tensor, rank: int, pg: dist.ProcessGroup
+) -> torch.Tensor:
+    """Split the tensor along dim 0 and keep the corresponding slice."""
     if pg.size() == 1:
         return input_
+    chunk_size = input_.size(0) // pg.size()
+    input_list = torch.split(input_, chunk_size, dim=0)
+    return input_list[rank].contiguous()
 
-    return funcol.all_reduce(input_, "sum", pg)
-
-
-def _split(input_: torch.Tensor, rank: int, pg: dist.ProcessGroup) -> torch.Tensor:
-    """Split the tensor along its last dimension and keep the
-    corresponding slice."""
-
-    if pg.size() == 1:
-        return input_
-
-    # Split along last dimension.
-    # Get the size and dimension.
-    last_dim = input_.dim() - 1
-    last_dim_size = input_.size()[last_dim] // pg.size()
-    # Split.
-    input_list = torch.split(input_, last_dim_size, dim=last_dim)
-
-    # Note: torch.split does not create contiguous tensors by default.
-    output = input_list[rank].contiguous()
-
-    return output
-def apply_gather_tensor_cp(input_: torch.Tensor, rank: int, pg: dist.ProcessGroup) -> torch.Tensor:
-    return  funcol.all_gather_tensor(
-            input_.contiguous(),
-            gather_dim=0,
-            group=pg)
 
 class _AllGatherFromContextParallelRegion(torch.autograd.Function):
-    """Gather the input from the model parallel region."""
+    """Gather the input from the context parallel region (split on backward)."""
 
     @staticmethod
-    def symbolic(graph, input_, pg):
+    def symbolic(
+        graph, input_: torch.Tensor, rank: int, pg: dist.ProcessGroup
+    ) -> torch.Tensor:
         return _all_gather(input_, pg)
 
     @staticmethod
-    def forward(ctx, input_, rank, pg):
+    def forward(
+        ctx, input_: torch.Tensor, rank: int, pg: dist.ProcessGroup
+    ) -> torch.Tensor:
         ctx.rank = rank
         ctx.pg = pg
         return _all_gather(input_, pg)
 
     @staticmethod
-    def backward(ctx, grad_output):
-        return _split(grad_output, ctx.rank, ctx.pg)
+    def backward(ctx, grad_output: torch.Tensor):
+        return _split(grad_output, ctx.rank, ctx.pg), None, None
+
 
 def all_gather_from_context_parallel_region(
-        input_: torch.LongTensor, rank: int, pg: dist.ProcessGroup
-):
+    input_: torch.Tensor, rank: int, pg: dist.ProcessGroup
+) -> torch.Tensor:
     return _AllGatherFromContextParallelRegion.apply(input_, rank, pg)
