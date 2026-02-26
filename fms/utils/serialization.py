@@ -529,6 +529,7 @@ def load_state_dict_into_model(
 
     # 2. Decide if model needs sharding and how (for now only TP)
     needs_tp_sharding = checkpoint_sharding != "tp" and distributed_strategy == "tp"
+
     # 3. Iterate over the weights and load them into the model
     used_keys = set()
     unused_keys = set()
@@ -653,6 +654,7 @@ def _load_partial_state_dict(
                     setattr(target_module, key_steps[-1], param)
                     param = getattr(target_module, key_steps[-1])
                 param.copy_(tensor_value, non_blocking=True)
+
             if needs_tp_sharding and tp_module is not None and tp_module not in seen_tp_modules:
                 seen_tp_modules.add(tp_module)
                 tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
@@ -677,7 +679,6 @@ def _load_partial_state_dict(
                     )
                 )
                 unused_keys_tp = tp_module.load_weights(tensor_values)
-
         except Exception as e:
             # capture error specific to shape mismatch and halt the processing
             if "shape" in str(e) or "size" in str(e):

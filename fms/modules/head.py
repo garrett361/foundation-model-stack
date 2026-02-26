@@ -12,6 +12,7 @@ from fms.distributed.tensorparallel import (
 )
 from fms.modules.tp import TPModule
 
+
 class MLPClassificationHead(nn.Module):
     """
     A general purpose Classification Head. When applied on the output of a

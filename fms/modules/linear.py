@@ -7,6 +7,7 @@ from torch import nn
 from fms.modules import UninitializedModule
 from fms.modules.tp import ShardType, TPModule
 
+
 __type_factory_map: dict[str, Callable] = {}
 __type_sharding_map: dict[str, Callable] = {}
 
@@ -182,6 +183,7 @@ def shard_base_linear(
     all_params: dict = {}
     used_keys: set[str] = set()
     unused_keys: set[str] = set()
+
     # Collect all parameters to be copied on selected sharded modules
     param_count = 0
     for module_name in module_sharding_info:
@@ -247,6 +249,7 @@ def shard_torch_linear(
         param_sharding_info,
     )
     return unused_keys
+
 
 register_linear_type_to_module_map("torch_linear", nn.Linear)
 register_linear_type_to_sharding_map("torch_linear", shard_torch_linear)
