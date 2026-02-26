@@ -10,22 +10,20 @@ from typing import (
     Tuple,
     TypedDict,
 )
-from typing_extensions import NotRequired, Unpack
 
 import torch
 import torch.distributed
+import torch.distributed as dist
 from torch import Tensor, nn
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.nn import functional as F
+from typing_extensions import NotRequired, Unpack
 
 from fms import distributed
-import torch.distributed as dist
+from fms.distributed.contextparallel import all_gather_from_context_parallel_region
 from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
-)
-from fms.distributed.contextparallel import (
-    all_gather_from_context_parallel_region
 )
 from fms.modules.linear import (
     LinearModuleShardingInfo,
@@ -188,12 +186,14 @@ def _sdpa_store_op(
         )
     else:
         return (keys, values, keys, values)
+
+
 def torch_attn_primitives(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     mask: Optional[torch.Tensor],
-    scale: float,
+    scale: float | None,
     is_causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -216,7 +216,7 @@ def torch_attn_primitives(
     NOTE: if the model uses RoPE, some care must also be taken that RoPE is properly applied.
     Namely, different CP ranks need to offset their seq idx positions appropriately.
     """
-    _, n_q_heads, seqlen, d_head = q.shape
+    _, n_q_heads, seqlen, _ = q.shape
     n_k_heads = k.shape[1]
     gqa_ratio, remainder = divmod(n_q_heads, n_k_heads)
     if remainder:
@@ -226,6 +226,8 @@ def torch_attn_primitives(
     if gqa_ratio != 1:
         k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
         v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
+    if scale is None:
+        scale = q.size(-1) ** -0.5
     scores = (q @ k.transpose(-1, -2)) * scale
     if is_causal:
         if mask is None:
@@ -237,6 +239,7 @@ def torch_attn_primitives(
     numerator = scores @ v
     denominator = scores.sum(dim=-1, keepdim=True)
     return numerator, denominator, max_score
+
 
 def _sdpa_compute_op_cp(
     query: torch.Tensor,
@@ -294,13 +297,19 @@ def _sdpa_compute_op_cp(
         "is_causal_mask",
         mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
     )
-    numerator, denominator, max_score = torch_attn_primitives(queries,keys_e,values_e, attn_mask,scale_factor,is_causal)
+    numerator, denominator, max_score = torch_attn_primitives(
+        queries, keys_e, values_e, attn_mask, scale_factor, is_causal
+    )
     rank, world_size = distributed.rank_and_world(group)
-    for idx in range(0, world_size-1):
-        if is_causal: #and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
+    for idx in range(0, world_size - 1):
+        if is_causal:  # and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
             #     # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
-            keys_e = all_gather_from_context_parallel_region(keys_e,rank=rank,pg=group)
-            values_e = all_gather_from_context_parallel_region(values_e,rank=rank,pg=group)
+            keys_e = all_gather_from_context_parallel_region(
+                keys_e, rank=rank, pg=group
+            )
+            values_e = all_gather_from_context_parallel_region(
+                values_e, rank=rank, pg=group
+            )
             k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
             keys_e = k_blocks[idx]
             v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
@@ -308,7 +317,7 @@ def _sdpa_compute_op_cp(
 
             # Update local results
             ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
-                queries, keys_e, values_e, attn_mask,scale_factor, is_causal=False
+                queries, keys_e, values_e, attn_mask, scale_factor, is_causal=False
             )
             new_max_score = torch.maximum(max_score, ring_max_score)
             numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
@@ -331,6 +340,7 @@ def _sdpa_compute_op_cp(
     # b x qlen x (d)
     attn = attn.transpose(2, 1).contiguous()
     return attn
+
 
 def _sdpa_compute_op(
     query: torch.Tensor,
@@ -776,6 +786,7 @@ class MultiHeadAttention(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
+
     def to_cp(self, group: ProcessGroup) -> "CPMultiHeadAttention":
         return CPMultiHeadAttention.import_module(self, group)
 
@@ -1152,6 +1163,12 @@ class CPMultiHeadAttention(MultiHeadAttention):
 
         attn_kwargs["attn_name"] = "sdpa_causal_cp"
         return MultiHeadAttention.forward(
-            self, q, k, v, position_ids, past_key_value_state, use_cache,
+            self,
+            q,
+            k,
+            v,
+            position_ids,
+            past_key_value_state,
+            use_cache,
             **attn_kwargs,
         )
