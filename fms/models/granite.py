@@ -401,7 +401,7 @@ class Granite(nn.Module):
             **attn_kwargs,
         )
 
-        output = self.distributed_strategy.gather_tensor(output)
+        output = self.distributed_strategy.distribute_output(output)
         output = gather_outputs(output, last_n_tokens, **attn_kwargs)
         preds = self.head(output)
         preds = preds / self.config.logits_scaling

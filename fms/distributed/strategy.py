@@ -6,8 +6,7 @@ import torch
 import torch.distributed
 from torch import nn
 
-from fms.utils import tp_wrapping, cp_wrapping
-
+from fms.utils import cp_wrapping, tp_wrapping
 
 if "DISTRIBUTED_STRATEGY_IGNORE_MODULES" in os.environ:
     _distributed_strategy_ignore_modules = os.environ[
@@ -49,16 +48,17 @@ class DistributedStrategy:
             print(f"ignoring block={block_name} when distributing layer")
             return block
 
-    def distribute_input(self, model_input:torch.LongTensor):
+    def distribute_input(self, model_input: torch.Tensor) -> torch.Tensor:
         """
         Distribute input as-appropriate
         """
-        return self._distribute_input(model_input) 
-    def gather_tensor(self, model_input:torch.LongTensor):
+        return model_input
+
+    def distribute_output(self, model_output: torch.Tensor) -> torch.Tensor:
         """
-        Distribute input as-appropriate
+        Distribute output as-appropriate
         """
-        return self._gather_tensor(model_input)
+        return model_output
 
     @abstractmethod
     def _distribute_module(
@@ -76,12 +76,6 @@ class DistributedStrategy:
         """
         pass
 
-    def _distribute_input(self, model_input: torch.Tensor) -> torch.Tensor:
-        return model_input
-
-    def _gather_tensor(self, model_input: torch.Tensor) -> torch.Tensor:
-        return model_input
-
 
 class NotDistributed(DistributedStrategy):
     def __init__(self, from_meta=False):
@@ -94,8 +88,6 @@ class NotDistributed(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return block
-    def _distribute_input(self,model_input:torch.LongTensor):
-        return model_input
 
 
 NoOpStrategy = NotDistributed()
@@ -178,7 +170,7 @@ class TensorParallelStrategy(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return tp_wrapping.apply_tp(block, self.group)
-    
+
 
 class ContextParallelStrategy(DistributedStrategy):
     def __init__(self, group=None, from_meta=False):
@@ -193,16 +185,18 @@ class ContextParallelStrategy(DistributedStrategy):
         return module
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        assert isinstance(self.group, torch.distributed.ProcessGroup)
         return cp_wrapping.apply_layer_cp(block, self.group)
 
-    def _distribute_input(self, model_input: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    def distribute_input(self, model_input: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        assert isinstance(self.group, torch.distributed.ProcessGroup)
         chunk, self.original_size = cp_wrapping.apply_input_cp(
             model_input, self.group, dim=dim
         )
         return chunk
 
-    def _gather_tensor(self, model_input: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    def distribute_output(self, model_output: torch.Tensor) -> torch.Tensor:
+        assert isinstance(self.group, torch.distributed.ProcessGroup)
         return cp_wrapping.apply_gather_tensor_cp(
-            model_input, self.group, dim=dim, original_size=self.original_size
+            model_output, self.group, original_size=self.original_size
         )
-
