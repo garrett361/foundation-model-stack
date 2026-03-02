@@ -14,13 +14,13 @@ from typing import (
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from torch import Tensor, nn
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.nn import functional as F
 from typing_extensions import NotRequired, Unpack
 
 from fms import distributed
-from fms.distributed.contextparallel import all_gather_from_context_parallel_region
 from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
@@ -254,29 +254,14 @@ def _sdpa_compute_op_cp(
 ) -> torch.Tensor:
     queries = query.transpose(2, 1)
 
-    # no longer transposing prior to store, so need to check this in case of no cache
     if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
         key_cache = key_cache.transpose(2, 1)
         value_cache = value_cache.transpose(2, 1)
-    mask = attn_kwargs.get("mask", None)
-    # TODO: Once we add alibi support, merge rel pos bias and mask into single float mask
-    if mask is not None:
-        # Our expected mask format is bs x q_len x k_len, so to make it broadcastable
-        # we need to create the nheads dimension
-        while len(mask.size()) != 4:  # expects bs (x nheads) x q_len x kv_len
-            mask = mask.unsqueeze(1)
 
-    # Expand kv so black-box attn will work
-    expansion = nheads // kvheads
-    # k/v: b h l d
-    if expansion != 1:
-        keys_e = key_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-        values_e = (
-            value_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-        )
-    else:
-        keys_e = key_cache
-        values_e = value_cache
+    mask = attn_kwargs.get("mask", None)
+    if mask is not None:
+        while len(mask.size()) != 4:
+            mask = mask.unsqueeze(1)
 
     attn_mask = mask
     if attn_mask is not None and attn_mask.dtype != torch.bool:
@@ -286,49 +271,49 @@ def _sdpa_compute_op_cp(
         "is_causal_mask",
         mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
     )
-    numerator, denominator, max_score = torch_attn_primitives(
-        queries, keys_e, values_e, attn_mask, scale_factor, is_causal
-    )
+
     rank, world_size = distributed.rank_and_world(group)
-    for idx in range(world_size - 1):
-        if is_causal:  # and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
-            #     # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
-            keys_e = all_gather_from_context_parallel_region(
-                keys_e, rank=rank, pg=group
-            )
-            values_e = all_gather_from_context_parallel_region(
-                values_e, rank=rank, pg=group
-            )
-            k_blocks = torch.chunk(keys_e, chunks=world_size, dim=0)
-            keys_e = k_blocks[idx]
-            v_blocks = torch.chunk(values_e, chunks=world_size, dim=0)
-            values_e = v_blocks[idx]
 
-            # Update local results
-            ring_numerator, ring_denominator, ring_max_score = torch_attn_primitives(
-                queries, keys_e, values_e, attn_mask, scale_factor, is_causal=False
-            )
-            new_max_score = torch.maximum(max_score, ring_max_score)
-            numerator = (ring_max_score - new_max_score).exp() * ring_numerator + (
-                max_score - new_max_score
-            ).exp() * numerator
-            denominator = (ring_max_score - new_max_score).exp() * ring_denominator + (
-                max_score - new_max_score
-            ).exp() * denominator
-            max_score = new_max_score
+    if world_size <= 1:
+        num, den, _ = torch_attn_primitives(
+            queries, key_cache, value_cache, attn_mask, scale_factor, is_causal
+        )
+        return (num / den).transpose(2, 1).contiguous()
 
-    attn = numerator / denominator
-    if attn_algorithm:
-        torch.backends.cuda.enable_flash_sdp(__sdpa_previous_flash)
-        torch.backends.cuda.enable_mem_efficient_sdp(__sdpa_previous_mem_efficient)
-        torch.backends.cuda.enable_math_sdp(__sdpa_previous_math)
+    # All-gather KV along seq dim once: (b, kvheads, local_seq, d) -> (b, kvheads, full_seq, d)
+    # Using autograd variant for correct backward (reduce_scatter) through Gloo
+    full_keys = funcol.all_gather_tensor_autograd(
+        key_cache.contiguous(), gather_dim=2, group=group
+    )
+    full_values = funcol.all_gather_tensor_autograd(
+        value_cache.contiguous(), gather_dim=2, group=group
+    )
 
-    # attn: bs x seq_len x nheads*emb_v_per_head
-    # attn: b x h x qlen x ds
-    # attn after permute: b x qlen x h x ds
-    # b x qlen x (d)
-    attn = attn.transpose(2, 1).contiguous()
-    return attn
+    k_chunks = full_keys.chunk(world_size, dim=2)
+    v_chunks = full_values.chunk(world_size, dim=2)
+
+    numerator = denominator = max_score = None
+
+    for i in range(world_size):
+        if is_causal and i > rank:
+            continue
+
+        block_is_causal = is_causal and (i == rank)
+        block_num, block_den, block_ms = torch_attn_primitives(
+            queries, k_chunks[i], v_chunks[i], attn_mask, scale_factor, block_is_causal
+        )
+
+        if numerator is None:
+            numerator, denominator, max_score = block_num, block_den, block_ms
+        else:
+            new_ms = torch.maximum(max_score, block_ms)
+            exp_old = (max_score - new_ms).exp()
+            exp_new = (block_ms - new_ms).exp()
+            numerator = exp_new * block_num + exp_old * numerator
+            denominator = exp_new * block_den + exp_old * denominator
+            max_score = new_ms
+
+    return (numerator / denominator).transpose(2, 1).contiguous()
 
 
 def _sdpa_compute_op(
