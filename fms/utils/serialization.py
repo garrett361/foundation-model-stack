@@ -557,6 +557,7 @@ def load_state_dict_into_model(
                 model=model,
                 state_dict=fms_partial_sd,
                 needs_tp_sharding=needs_tp_sharding,
+                distributed_strategy=distributed_strategy,
                 dtype=dtype,
             )
             unused_keys.update(unused_keys_partial)
@@ -602,6 +603,7 @@ def _load_partial_state_dict(
     model: torch.nn.Module,
     state_dict: Mapping[str, Any],
     needs_tp_sharding: bool,
+    distributed_strategy: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> set:
     unused_keys = set()
@@ -630,7 +632,7 @@ def _load_partial_state_dict(
                     target_module = target_module[int(key_steps[key_step])]  # type: ignore[index]
                     prefix += "." + key_steps[key_step]
                     key_step += 1
-                if isinstance(target_module, TPModule):
+                if distributed_strategy == 'tp' and isinstance(target_module, TPModule):
                     tp_module = target_module
                     tp_prefix = prefix
             except AttributeError:
@@ -639,8 +641,6 @@ def _load_partial_state_dict(
 
         # Check if target_module has the Parameter/buffer
         try:
-            # If TP sharding is not needed, copy the parameter
-            # into the model
             if not needs_tp_sharding or tp_module is None:
                 param = getattr(target_module, key_steps[-1])
 
@@ -655,7 +655,7 @@ def _load_partial_state_dict(
                     param = getattr(target_module, key_steps[-1])
                 param.copy_(tensor_value, non_blocking=True)
 
-            elif tp_module is not None and tp_module not in seen_tp_modules:
+            if needs_tp_sharding and tp_module is not None and tp_module not in seen_tp_modules:
                 seen_tp_modules.add(tp_module)
                 tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
 

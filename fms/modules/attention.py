@@ -10,13 +10,15 @@ from typing import (
     Tuple,
     TypedDict,
 )
-from typing_extensions import NotRequired, Unpack
 
 import torch
 import torch.distributed
+import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from torch import Tensor, nn
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.nn import functional as F
+from typing_extensions import NotRequired, Unpack
 
 from fms import distributed
 from fms.distributed.tensorparallel import (
@@ -186,6 +188,134 @@ def _sdpa_store_op(
         return (keys, values, keys, values)
 
 
+def torch_attn_primitives(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    scale: float | None,
+    is_causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns the softmax numerator, denominator, and max scale. These are primitive values which can
+    be used to build normal softmax attention and ring attention.
+
+    It is redundant to return both the denominator and max_score. They always appear in a particular
+    combination together and so just one tensor can be returned instead of two. But, this is good
+    enough for now. TODO: @goon - optimize.
+
+    TODO: @goon - rewrite in terms of aten._scaled_dot_product_flash_attention.default
+
+    NOTE: if any of the below aten ops are supported, we can also build ring attention using them,
+    but we assume they are not generally available:
+    * aten._scaled_dot_product_flash_attention
+    * aten._scaled_dot_product_efficient_attention
+    * aten._scaled_dot_product_cudnn_attention
+    See the native torch CP attn implementation: https://github.com/pytorch/pytorch/blob/e7cc42df58a86bee05944f6e80c535aa1d099443/torch/distributed/tensor/experimental/_attention.py?plain=1#L1
+
+    NOTE: if the model uses RoPE, some care must also be taken that RoPE is properly applied.
+    Namely, different CP ranks need to offset their seq idx positions appropriately.
+    """
+    _, n_q_heads, seqlen, _ = q.shape
+    n_k_heads = k.shape[1]
+    gqa_ratio, remainder = divmod(n_q_heads, n_k_heads)
+    if remainder:
+        raise ValueError(
+            f"The number of q-heads must be divisible by the number of k-heads: {q.shape=}, {k.shape=}"
+        )
+    if gqa_ratio != 1:
+        k = k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
+        v = v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1, -1).flatten(1, 2)
+    if scale is None:
+        scale = q.size(-1) ** -0.5
+    scores = (q @ k.transpose(-1, -2)) * scale
+    if is_causal:
+        if mask is None:
+            mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=scores.device)
+            mask = torch.triu(mask, diagonal=1)
+        scores.masked_fill_(mask[None], float("-inf"))
+    max_score = scores.max(dim=-1, keepdim=True).values
+    scores = (scores - max_score).exp()
+    numerator = scores @ v
+    denominator = scores.sum(dim=-1, keepdim=True)
+    return numerator, denominator, max_score
+
+
+def _sdpa_compute_op_cp(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    nheads: int,
+    kvheads: int,
+    p_dropout: float,
+    scale_factor: Optional[float],
+    group: Optional[ProcessGroup],
+    **attn_kwargs,
+) -> torch.Tensor:
+    queries = query.transpose(2, 1)
+
+    if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
+        key_cache = key_cache.transpose(2, 1)
+        value_cache = value_cache.transpose(2, 1)
+
+    mask = attn_kwargs.get("mask", None)
+    if mask is not None:
+        while len(mask.size()) != 4:
+            mask = mask.unsqueeze(1)
+
+    attn_mask = mask
+    if attn_mask is not None and attn_mask.dtype != torch.bool:
+        attn_mask = attn_mask.to(dtype=queries.dtype)
+
+    is_causal = attn_kwargs.get(
+        "is_causal_mask",
+        mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
+    )
+
+    rank, world_size = distributed.rank_and_world(group)
+
+    if world_size <= 1:
+        num, den, _ = torch_attn_primitives(
+            queries, key_cache, value_cache, attn_mask, scale_factor, is_causal
+        )
+        return (num / den).transpose(2, 1).contiguous()
+
+    # All-gather KV along seq dim once: (b, kvheads, local_seq, d) -> (b, kvheads, full_seq, d)
+    # Using autograd variant for correct backward (reduce_scatter) through Gloo
+    full_keys = funcol.all_gather_tensor_autograd(
+        key_cache.contiguous(), gather_dim=2, group=group
+    )
+    full_values = funcol.all_gather_tensor_autograd(
+        value_cache.contiguous(), gather_dim=2, group=group
+    )
+
+    k_chunks = full_keys.chunk(world_size, dim=2)
+    v_chunks = full_values.chunk(world_size, dim=2)
+
+    numerator = denominator = max_score = None
+
+    for i in range(world_size):
+        if is_causal and i > rank:
+            continue
+
+        block_is_causal = is_causal and (i == rank)
+        block_num, block_den, block_ms = torch_attn_primitives(
+            queries, k_chunks[i], v_chunks[i], attn_mask, scale_factor, block_is_causal
+        )
+
+        if numerator is None:
+            numerator, denominator, max_score = block_num, block_den, block_ms
+        else:
+            new_ms = torch.maximum(max_score, block_ms)
+            exp_old = (max_score - new_ms).exp()
+            exp_new = (block_ms - new_ms).exp()
+            numerator = exp_new * block_num + exp_old * numerator
+            denominator = exp_new * block_den + exp_old * denominator
+            max_score = new_ms
+
+    return (numerator / denominator).transpose(2, 1).contiguous()
+
+
 def _sdpa_compute_op(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -194,6 +324,7 @@ def _sdpa_compute_op(
     kvheads: int,
     p_dropout: float,
     scale_factor: Optional[float],
+    group: Optional[ProcessGroup],
     **attn_kwargs,
 ) -> torch.Tensor:
     queries = query.transpose(2, 1)
@@ -294,6 +425,12 @@ register_attention_op(
     "sdpa_causal",
     _sdpa_store_op,
     _sdpa_compute_op,
+    update_attn_kwargs_op=_sdpa_update_attn_kwargs,
+)
+register_attention_op(
+    "sdpa_causal_cp",
+    _sdpa_store_op,
+    _sdpa_compute_op_cp,
     update_attn_kwargs_op=_sdpa_update_attn_kwargs,
 )
 register_attention_op(
@@ -576,6 +713,7 @@ class MultiHeadAttention(nn.Module):
         fused: bool = True,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
+        group: Optional[ProcessGroup] = None,
     ):
         super(MultiHeadAttention, self).__init__()
         self.nheads = nheads
@@ -588,6 +726,7 @@ class MultiHeadAttention(nn.Module):
         self.fused = fused
         self.linear_config = linear_config
         self.scale_factor = scale_factor
+        self.group = group
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -622,6 +761,9 @@ class MultiHeadAttention(nn.Module):
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
 
+    def to_cp(self, group: ProcessGroup) -> "CPMultiHeadAttention":
+        return CPMultiHeadAttention.import_module(self, group)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -650,7 +792,6 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
-
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
         # if we dont have the cache yet, we need to compute
@@ -660,7 +801,6 @@ class MultiHeadAttention(nn.Module):
         # b x h x kvlen x ds
         # todo: Cross attention (This always is true for now)
         q_out, k_out, v_out = self.in_proj(q, k, v)
-
         # note: transposes will be moved in a later PR to fix dis-contiguous tensor issues
         queries = q_out.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
@@ -671,7 +811,6 @@ class MultiHeadAttention(nn.Module):
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
-
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
         if use_cache:
@@ -699,6 +838,7 @@ class MultiHeadAttention(nn.Module):
                 self.kvheads,
                 self.p_dropout if self.training else 0.0,
                 self.scale_factor,
+                self.group,
                 **attn_kwargs,
             )
         else:
@@ -712,7 +852,6 @@ class MultiHeadAttention(nn.Module):
                 self.scale_factor,
                 **attn_kwargs,
             )
-
         attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         out = self.dense(attn)
 
@@ -777,6 +916,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
+            group,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -911,3 +1051,98 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         else:
             out = reduce_from_tensor_model_parallel_region(out_par, self.group)
             return out
+
+
+class CPMultiHeadAttention(MultiHeadAttention):
+    """
+    Multi-headed attention with context parallel support.
+
+    No head sharding: the full model exists on every rank. Only the sequence
+    dimension is split across the CP group, and the ring attention loop in
+    _sdpa_compute_op_cp handles the cross-rank KV communication.
+    """
+
+    def __init__(
+        self,
+        emb_dim,
+        emb_kq,
+        emb_v,
+        nheads,
+        kvheads,
+        p_dropout=None,
+        use_bias=False,
+        position_encoder: Optional[PositionEncoder] = None,
+        fused: bool = True,
+        group: Optional[ProcessGroup] = None,
+        linear_config: Optional[Mapping[str, Any]] = None,
+        scale_factor: Optional[float] = None,
+    ):
+        assert torch.distributed.is_initialized()
+        rank, world_size = distributed.rank_and_world(group)
+        MultiHeadAttention.__init__(
+            self,
+            emb_dim,
+            emb_kq,
+            emb_v,
+            nheads,
+            kvheads,
+            p_dropout,
+            use_bias,
+            position_encoder,
+            fused,
+            linear_config,
+            scale_factor,
+            group,
+        )
+        self.cp_rank = rank
+        self.cp_world_size = world_size
+        self.cp_group = group if group is not None else dist.group.WORLD
+
+    @staticmethod
+    def import_module(
+        mha: MultiHeadAttention, group: ProcessGroup
+    ) -> "CPMultiHeadAttention":
+        return CPMultiHeadAttention(
+            emb_dim=mha.emb_dim,
+            emb_kq=mha.emb_kq_per_head,
+            emb_v=mha.emb_v_per_head,
+            nheads=mha.nheads,
+            kvheads=mha.kvheads,
+            p_dropout=mha.p_dropout,
+            use_bias=mha.use_bias,
+            position_encoder=mha.position_encoder,
+            group=group,
+            fused=mha.fused,
+            linear_config=mha.linear_config,
+            scale_factor=mha.scale_factor,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        position_ids=None,
+        past_key_value_state: Optional[Tuple[Tensor | None, Tensor | None]] = None,
+        use_cache=False,
+        **attn_kwargs: Unpack[AttentionKwargs],
+    ):
+        if use_cache:
+            raise NotImplementedError("KV cache not yet supported with CP")
+
+        # Offset position_ids so each CP rank uses global sequence positions
+        if position_ids is not None:
+            offset = q.size(1) * self.cp_rank
+            position_ids = position_ids + offset
+
+        attn_kwargs["attn_name"] = "sdpa_causal_cp"
+        return MultiHeadAttention.forward(
+            self,
+            q,
+            k,
+            v,
+            position_ids,
+            past_key_value_state,
+            use_cache,
+            **attn_kwargs,
+        )

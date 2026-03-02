@@ -17,6 +17,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from fms import distributed
 from fms.distributed.strategy import (
     TensorParallelStrategy,
+    ContextParallelStrategy,
     UniformModelParallelStrategy,
 )
 from fms.modules import UninitializedModule
@@ -404,6 +405,9 @@ def get_model(
         if distributed_strategy == "tp":
             print("using tensor parallel")
             extra_args["distributed_strategy"] = TensorParallelStrategy(group)
+        elif distributed_strategy == "cp":
+            logger.info("using context parallel")
+            extra_args["distributed_strategy"] = ContextParallelStrategy(group)
         elif distributed_strategy == "mp":
             print("using model parallel")
             devices = [i for i in range(torch.cuda.device_count())]
