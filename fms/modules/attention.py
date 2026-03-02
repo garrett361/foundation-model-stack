@@ -278,17 +278,6 @@ def _sdpa_compute_op_cp(
         keys_e = key_cache
         values_e = value_cache
 
-    attn_algorithm = attn_kwargs.get("attn_algorithm", None)
-    if attn_algorithm:
-        # Pick which fused attn kernels will run.
-        use_flash = attn_algorithm == "flash"
-        use_mem_efficient = attn_algorithm == "mem"
-        use_math = attn_algorithm == "math"
-
-        torch.backends.cuda.enable_flash_sdp(use_flash)
-        torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
-        torch.backends.cuda.enable_math_sdp(use_math)
-
     attn_mask = mask
     if attn_mask is not None and attn_mask.dtype != torch.bool:
         attn_mask = attn_mask.to(dtype=queries.dtype)
@@ -301,7 +290,7 @@ def _sdpa_compute_op_cp(
         queries, keys_e, values_e, attn_mask, scale_factor, is_causal
     )
     rank, world_size = distributed.rank_and_world(group)
-    for idx in range(0, world_size - 1):
+    for idx in range(world_size - 1):
         if is_causal:  # and (idx == (rank - 1) % world_size | idx == (rank + 1) % world_size):#self.rank:
             #     # TODO: @goon - torch compile complains that we didn't do anything with the k, v tensors
             keys_e = all_gather_from_context_parallel_region(
