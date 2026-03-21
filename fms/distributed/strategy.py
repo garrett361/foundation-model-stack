@@ -87,7 +87,8 @@ class DistributedStrategy:
         """
         Gather from each rank
         """
-        pass
+        return model_input
+        #pass
 
 
 class NotDistributed(DistributedStrategy):

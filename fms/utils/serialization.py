@@ -375,6 +375,8 @@ def load_state_dict(
         raise ValueError("FSDP checkpoints can only be loaded into an FSDP model")
     if checkpoint_sharding == "tp" and distributed_strategy != "tp":
         raise ValueError("TP checkpoints can only be loaded into a TP model")
+    if checkpoint_sharding == "cp" and distributed_strategy != "cp":
+        raise ValueError("CP checkpoints can only be loaded into a CP model")
     #TODO add if for cp
 
     # Before creating the Path object, check if model_path has a glob pattern
