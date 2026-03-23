@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from fms.modules.ssm import SSMCacheUnit
+from fms import distributed
+from fms.distributed.contextparallel import (
+    all_gather_from_context_parallel_region
+)
 
 
 logger = logging.getLogger(__name__)
@@ -261,7 +265,6 @@ def generate(
         start_time = time.time()
 
     eos_reached: bool = False
-
     for i in range(max_new_tokens):
         input_ids = next_input[:, -max_seq_len:]
 
@@ -274,6 +277,7 @@ def generate(
             input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
 
         output = model(input_ids, **kwargs)
+        dr = distributed.local_rank()
         if use_cache:
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
@@ -304,12 +308,13 @@ def generate(
             next_val = torch.multinomial(probs, num_samples=1)
         else:
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
-
+        print(dr,next_val)
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
                 i + prompt_length, logits, next_val, kwargs
             )
 
+        #torch.save(result, '/home/senuser/nv_cp.pt')
         result = torch.cat((result, next_val), dim=-1)
 
         # avoid continuing to generate if all have reached EOS
@@ -332,6 +337,7 @@ def generate(
 
         if eos_reached:
             break
+        break
 
     if timing == "e2e":
         if input_ids.device.type == "cuda":

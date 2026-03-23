@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional, Set, Union
 import torch
 
 from fms.modules.tp import TPModule
+from fms.modules.cp import CPModule
 from fms.utils.config import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,9 @@ def load_state_dict(
         raise ValueError("FSDP checkpoints can only be loaded into an FSDP model")
     if checkpoint_sharding == "tp" and distributed_strategy != "tp":
         raise ValueError("TP checkpoints can only be loaded into a TP model")
+    if checkpoint_sharding == "cp" and distributed_strategy != "cp":
+        raise ValueError("CP checkpoints can only be loaded into a CP model")
+    #TODO add if for cp
 
     # Before creating the Path object, check if model_path has a glob pattern
     if isinstance(model_path, str):
@@ -529,7 +533,7 @@ def load_state_dict_into_model(
 
     # 2. Decide if model needs sharding and how (for now only TP)
     needs_tp_sharding = checkpoint_sharding != "tp" and distributed_strategy == "tp"
-
+    needs_cp_sharding = checkpoint_sharding != "cp" and distributed_strategy == "cp"
     # 3. Iterate over the weights and load them into the model
     used_keys = set()
     unused_keys = set()
@@ -557,6 +561,8 @@ def load_state_dict_into_model(
                 model=model,
                 state_dict=fms_partial_sd,
                 needs_tp_sharding=needs_tp_sharding,
+                needs_cp_sharding=needs_cp_sharding,
+                distributed_strategy=distributed_strategy,
                 dtype=dtype,
             )
             unused_keys.update(unused_keys_partial)
@@ -602,11 +608,15 @@ def _load_partial_state_dict(
     model: torch.nn.Module,
     state_dict: Mapping[str, Any],
     needs_tp_sharding: bool,
+    needs_cp_sharding: bool,
+    distributed_strategy: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> set:
     unused_keys = set()
     unused_keys_tp = None
     seen_tp_modules = set()
+    unused_keys_cp = None
+    seen_cp_modules = set()
     for key, tensor_value in state_dict.items():
         target_module = model
         # Find where to put the weight and decide whether it needs TP'ing
@@ -615,6 +625,8 @@ def _load_partial_state_dict(
         key_step = 0
         tp_module = None
         tp_prefix = ""
+        cp_module = None
+        cp_prefix = ""
 
         # Navigate the model tree to find the module where the parameter is
         # located and whether there is a TPModule in the way in case the
@@ -630,18 +642,19 @@ def _load_partial_state_dict(
                     target_module = target_module[int(key_steps[key_step])]  # type: ignore[index]
                     prefix += "." + key_steps[key_step]
                     key_step += 1
-                if isinstance(target_module, TPModule):
+                if distributed_strategy == 'tp' and isinstance(target_module, TPModule):
                     tp_module = target_module
                     tp_prefix = prefix
+                elif distributed_strategy == 'cp' and isinstance(target_module, CPModule):
+                    cp_module = target_module
+                    cp_prefix = prefix
             except AttributeError:
                 unused_keys.add(key)
                 break
 
         # Check if target_module has the Parameter/buffer
         try:
-            # If TP sharding is not needed, copy the parameter
-            # into the model
-            if not needs_tp_sharding or tp_module is None:
+            if (not needs_tp_sharding and not needs_cp_sharding) or (tp_module is None and cp_module is None):
                 param = getattr(target_module, key_steps[-1])
 
                 # cast module parameter to non-meta device
@@ -654,8 +667,7 @@ def _load_partial_state_dict(
                     setattr(target_module, key_steps[-1], param)
                     param = getattr(target_module, key_steps[-1])
                 param.copy_(tensor_value, non_blocking=True)
-
-            elif tp_module is not None and tp_module not in seen_tp_modules:
+            if needs_tp_sharding and tp_module is not None and tp_module not in seen_tp_modules:
                 seen_tp_modules.add(tp_module)
                 tensor_values = {k: v for k, v in state_dict.items() if tp_prefix in k}
 
@@ -679,6 +691,32 @@ def _load_partial_state_dict(
                     )
                 )
                 unused_keys_tp = tp_module.load_weights(tensor_values)
+            elif needs_cp_sharding and cp_module is not None and cp_module not in seen_cp_modules:
+                seen_cp_modules.add(cp_module)
+                tensor_values = {k: v for k, v in state_dict.items() if cp_prefix in k}
+
+                # when tensors from ckpt have all the same dtype,
+                # it can be enforced onto the module parameters
+                is_single_dtype = (
+                    len(set([v.dtype for v in tensor_values.values()])) == 1
+                )
+
+                cp_module._apply(
+                    lambda t: _move_to_real_device(
+                        param=t,
+                        real_device=tensor_value.device,
+                        dtype=(
+                            dtype
+                            if dtype is not None
+                            else tensor_value.dtype
+                            if is_single_dtype
+                            else t.dtype
+                        ),
+                    )
+                )
+                unused_keys_cp = cp_module.load_weights(tensor_values)
+
+
         except Exception as e:
             # capture error specific to shape mismatch and halt the processing
             if "shape" in str(e) or "size" in str(e):
@@ -690,6 +728,8 @@ def _load_partial_state_dict(
                 ) from e
             if unused_keys_tp:
                 unused_keys.update(unused_keys_tp)
+            elif unused_keys_cp:
+                unused_keys.update(unused_keys_cp)
             else:
                 unused_keys.add(key)
 
